@@ -80,14 +80,9 @@ final class PointerLayers {
     let rod = CAGradientLayer()
     /// The drawn rod (Resources/Pointers/stick.svg), when bundled.
     let rodArt = CALayer()
-    private let rodFade = CAGradientLayer()
-    /// The solid rod: flat paint, a cel shade down one side, a shine stripe and an ink outline.
-    let rodSolid = CALayer()
-    private let solidFill = CAShapeLayer()
-    private let solidShade = CAShapeLayer()
-    private let solidShine = CAShapeLayer()
-    private let solidOutline = CAShapeLayer()
-    private let solidFade = CAGradientLayer()
+    /// Size and scale of the solid rod while it is showing, so setInk can repaint it
+    /// (its outline changes with the appearance).
+    private var solidSpec: (w: CGFloat, len: CGFloat, backing: CGFloat)?
     var art: PointerArt?
     var ink = Ink(dark: false)
     private var stickColor = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
@@ -136,11 +131,7 @@ final class PointerLayers {
         hand.shadowOpacity = 0
         stick.addSublayer(rod)
         stick.addSublayer(rodArt)
-        stick.addSublayer(rodSolid)
         rodArt.isHidden = true
-        rodSolid.isHidden = true
-        [solidFill, solidShade, solidShine, solidOutline].forEach(rodSolid.addSublayer)
-        rodSolid.mask = solidFade
     }
 
     private static let stickSVG: NSImage? = {
@@ -186,6 +177,52 @@ final class PointerLayers {
         return ctx.makeImage() ?? img
     }
 
+    /// Paints the solid rod (y up, cuff end at the top) with its far end faded out.
+    static func renderSolid(width w: CGFloat, length len: CGFloat, color: CGColor, outline: CGColor,
+                            backing: CGFloat) -> CGImage? {
+        let ow = max(1.2, w * 0.12)
+        let W = Int(ceil((w + ow * 2) * backing)), H = Int(ceil(len * backing))
+        guard W > 0, H > 0,
+              let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+        ctx.scaleBy(x: backing, y: backing)
+        let rect = CGRect(x: ow, y: ow / 2, width: w, height: len)   // top runs past the edge, under the cuff
+        let body = CGPath(roundedRect: rect, cornerWidth: w / 2, cornerHeight: w / 2, transform: nil)
+        ctx.addPath(body); ctx.setFillColor(color); ctx.fillPath()
+        // Cel shade: a band down the right (shadow) side, inside the outline.
+        let shadeRect = CGRect(x: rect.midX + w * 0.18, y: rect.minY, width: w * 0.26, height: len)
+        ctx.addPath(CGPath(roundedRect: shadeRect, cornerWidth: w * 0.13, cornerHeight: w * 0.13, transform: nil))
+        ctx.setFillColor(shade(of: color)); ctx.fillPath()
+        // Shine: a white stroke near the lit (left) edge, broken like a cel highlight.
+        let sx = rect.midX - w * 0.2, top = len
+        ctx.setStrokeColor(CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.85))
+        ctx.setLineWidth(max(1, w * 0.16)); ctx.setLineCap(.round)
+        ctx.move(to: CGPoint(x: sx, y: top - w * 1.7)); ctx.addLine(to: CGPoint(x: sx, y: top - len * 0.34))
+        ctx.move(to: CGPoint(x: sx, y: top - len * 0.34 - w * 0.9)); ctx.addLine(to: CGPoint(x: sx, y: top - len * 0.34 - w * 1.6))
+        ctx.strokePath()
+        ctx.addPath(body); ctx.setStrokeColor(outline); ctx.setLineWidth(ow); ctx.strokePath()
+        guard let img = ctx.makeImage() else { return nil }
+        return fadeFarEnd(img)
+    }
+
+    /// Fades the bottom 28% of a vertical rod bitmap to transparent, so the rod never
+    /// stops dead in the middle of the screen.
+    static func fadeFarEnd(_ img: CGImage) -> CGImage {
+        let W = img.width, H = img.height
+        guard let ctx = CGContext(data: nil, width: W, height: H, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue),
+              let grad = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                    colors: [CGColor(gray: 0, alpha: 0), CGColor(gray: 0, alpha: 1)] as CFArray,
+                                    locations: [0, 1]) else { return img }
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: W, height: H))
+        ctx.setBlendMode(.destinationIn)
+        ctx.drawLinearGradient(grad, start: .zero, end: CGPoint(x: 0, y: CGFloat(H) * 0.28),
+                               options: [.drawsAfterEndLocation])
+        return ctx.makeImage() ?? img
+    }
+
     /// A slightly darker, warmer cel shade of `color` (sepia-leaning, never grey).
     static func shade(of color: CGColor, by k: CGFloat = 1) -> CGColor {
         let (r, g, b) = rgb(color)
@@ -225,51 +262,25 @@ final class PointerLayers {
         let len = art.size.height * 5.6
         stick.isHidden = !art.hasStick
         stick.frame = CGRect(x: art.wrist.x, y: art.wrist.y, width: 0, height: 0)
-        rodSolid.isHidden = true
 
+        self.stickColor = stickColor
+        solidSpec = nil
         if art.hasStick && stickStyle == .solid {
-            // A plain painted dowel, thinner than the metal rod, in flat cel paint.
+            // A plain painted dowel, thinner than the metal rod, in flat cel paint. It is
+            // painted once into a bitmap: live shape layers under a mask would be redrawn by
+            // the window server on every frame of the idle sway, which makes the pointer lag.
             let w = max(5, art.size.height * 0.2)
-            let ow = max(1.2, w * 0.12)
-            let top = w * 0.6           // tucks a little way up under the cuff
-            let rect = CGRect(x: -w / 2, y: top - len, width: w, height: len)
+            solidSpec = (w, len, contentsScale)
             rod.isHidden = true
-            rodArt.isHidden = true
-            rodSolid.isHidden = false
-            rodSolid.frame = CGRect(x: 0, y: 0, width: 0, height: 0)
-            let body = CGPath(roundedRect: rect, cornerWidth: w / 2, cornerHeight: w / 2, transform: nil)
-            solidOutline.path = body
-            solidOutline.fillColor = nil
-            // The same even ink line as the hands; a near-black stick on a dark desktop
-            // gets a cream outline so it still shows.
-            // (Set in setInk, which also runs when the appearance changes.)
-            self.stickColor = stickColor
-            solidOutline.lineWidth = ow
-            solidFill.path = body
-            solidFill.fillColor = stickColor
-            // Cel shade: a band down the right (shadow) side, inside the outline.
-            let shadeRect = CGRect(x: w * 0.18, y: rect.minY, width: w * 0.26, height: len - w * 0.2)
-            solidShade.path = CGPath(roundedRect: shadeRect, cornerWidth: w * 0.13, cornerHeight: w * 0.13, transform: nil)
-            solidShade.fillColor = Self.shade(of: stickColor)
-            // Shine: a short white stroke near the lit (left) edge, broken like a cel highlight.
-            let shine = CGMutablePath()
-            let sx = -w * 0.2
-            shine.move(to: CGPoint(x: sx, y: top - w * 1.1))
-            shine.addLine(to: CGPoint(x: sx, y: top - len * 0.34))
-            shine.move(to: CGPoint(x: sx, y: top - len * 0.34 - w * 0.9))
-            shine.addLine(to: CGPoint(x: sx, y: top - len * 0.34 - w * 1.6))
-            solidShine.path = shine
-            solidShine.strokeColor = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.85)
-            solidShine.fillColor = nil
-            solidShine.lineWidth = max(1, w * 0.16)
-            solidShine.lineCap = .round
-            [solidFill, solidShade, solidShine, solidOutline].forEach { $0.contentsScale = contentsScale }
-            // Fade the far end so the rod never stops dead in the middle of the screen.
-            solidFade.frame = CGRect(x: rect.minX - ow, y: rect.minY, width: rect.width + ow * 2, height: rect.height + ow)
-            solidFade.startPoint = CGPoint(x: 0.5, y: 1)
-            solidFade.endPoint = CGPoint(x: 0.5, y: 0)
-            solidFade.colors = [CGColor.black, CGColor.black, CGColor.clear]
-            solidFade.locations = [0, 0.72, 1]
+            rodArt.isHidden = false
+            rodArt.mask = nil
+            rodArt.anchorPoint = CGPoint(x: 0.5, y: 1)
+            let pad = max(1.2, w * 0.12)
+            rodArt.bounds = CGRect(x: 0, y: 0, width: w + pad * 2, height: len)
+            // Tucks a little way up under the cuff.
+            rodArt.position = CGPoint(x: 0, y: w * 0.6)
+            rodArt.contentsScale = contentsScale
+            rodArt.contentsGravity = .resize
             CATransaction.commit()
             setInk(ink)
             return
@@ -278,7 +289,7 @@ final class PointerLayers {
         if art.hasStick, let svg = Self.stickSVG {
             let w = len * svg.size.width / svg.size.height
             if let raw = Self.renderStick(svg, size: CGSize(width: w, height: len), backing: contentsScale) {
-                let img = Self.tint(raw, stickColor)
+                let img = Self.fadeFarEnd(Self.tint(raw, stickColor))
                 rod.isHidden = true
                 rodArt.isHidden = false
                 rodArt.anchorPoint = CGPoint(x: 0.5, y: 1)
@@ -288,13 +299,8 @@ final class PointerLayers {
                 rodArt.contents = img
                 rodArt.contentsScale = contentsScale
                 rodArt.contentsGravity = .resize
-                // Fade the far end so the rod never stops dead in the middle of the screen.
-                rodFade.frame = rodArt.bounds
-                rodFade.startPoint = CGPoint(x: 0.5, y: 1)
-                rodFade.endPoint = CGPoint(x: 0.5, y: 0)
-                rodFade.colors = [CGColor.black, CGColor.black, CGColor.clear]
-                rodFade.locations = [0, 0.72, 1]
-                rodArt.mask = rodFade
+                // The far-end fade is baked into the bitmap (a live mask costs a redraw every frame).
+                rodArt.mask = nil
                 CATransaction.commit()
                 setInk(ink)
                 return
@@ -317,7 +323,13 @@ final class PointerLayers {
         self.ink = ink
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        solidOutline.strokeColor = Self.luminance(stickColor) < 0.25 && ink.dark ? Ink.cream : Ink.ink
+        if let spec = solidSpec {
+            // The same even ink line as the hands; a near-black stick on a dark desktop
+            // gets a cream outline so it still shows.
+            let line = Self.luminance(stickColor) < 0.25 && ink.dark ? Ink.cream : Ink.ink
+            rodArt.contents = Self.renderSolid(width: spec.w, length: spec.len, color: stickColor, outline: line,
+                                               backing: spec.backing)
+        }
         let c = ink.stick
         // Gradient runs from the wrist (top, y = 1) to the far end (bottom, y = 0).
         rod.startPoint = CGPoint(x: 0.5, y: 1)

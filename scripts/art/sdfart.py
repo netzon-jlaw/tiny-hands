@@ -1,4 +1,4 @@
-"""Tiny SDF -> SVG toolkit for moulded-plastic toy hands.
+"""Tiny SDF -> SVG toolkit for the ink-and-paint toy hands.
 
 Shapes are signed distance fields sampled on a grid (numpy). Regions are
 extracted with marching squares and written as plain SVG paths. Only the
@@ -8,6 +8,9 @@ import math
 import numpy as np
 
 H = 0.25  # grid step in viewBox units
+
+# Output transform applied to every emitted point: x' = k*x + ox, y' = k*y + oy.
+XFORM = (1.0, 0.0, 0.0)
 
 
 class Grid:
@@ -49,7 +52,9 @@ def ellipse(g, c, rx, ry, rot=0.0):
     px = (g.X - c[0]) * ca + (g.Y - c[1]) * sa
     py = -(g.X - c[0]) * sa + (g.Y - c[1]) * ca
     k = np.hypot(px / rx, py / ry)
-    return (k - 1.0) * min(rx, ry)
+    # first-order distance: the implicit value over its gradient, so offsets stay even all round
+    grad = np.hypot(px / (rx * rx), py / (ry * ry))
+    return np.where(k > 0.35, k * (k - 1.0) / np.maximum(grad, 1e-9), (k - 1.0) * min(rx, ry))
 
 
 def round_cone(g, a, b, r1, r2):
@@ -111,6 +116,108 @@ def finger(g, base, tip, r_base, r_neck, r_tip, k=3.0):
     neck = (tx - ux * r_tip * 1.05, ty - uy * r_tip * 1.05)
     shaft = round_cone(g, base, neck, r_base, r_neck)
     return smin(shaft, circle(g, tip, r_tip), k)
+
+
+# ------------------------------------------------------- true distance fields
+def redist(g, F, reach=9.0):
+    """Signed distance to the zero set of F, valid within `reach` units of it.
+
+    Smooth unions bend a field away from true distance; this straightens it out so
+    that offsets (ink lines, rounding) come out the same width everywhere. The cells
+    next to the edge keep F's own sub-cell crossing, and the eikonal equation
+    |grad u| = 1 is relaxed outwards from them, so the result has no grid stair-steps.
+    """
+    h = g.h
+    gy, gx = np.gradient(F, h)
+    lin = np.abs(F) / (np.hypot(gx, gy) + 1e-9)
+    s = F < 0
+    edge = np.zeros_like(s)
+    dv = s[:-1] != s[1:]
+    dh = s[:, :-1] != s[:, 1:]
+    edge[:-1] |= dv
+    edge[1:] |= dv
+    edge[:, :-1] |= dh
+    edge[:, 1:] |= dh
+    big = reach + 2.0
+    u = np.where(edge, np.minimum(lin, 1.5 * h), big)
+    for _ in range(int(big / h * 1.5) + 6):
+        p = np.pad(u, 1, mode='edge')
+        a = np.minimum(p[1:-1, :-2], p[1:-1, 2:])
+        b = np.minimum(p[:-2, 1:-1], p[2:, 1:-1])
+        d = np.abs(a - b)
+        un = np.where(d >= h, np.minimum(a, b) + h, 0.5 * (a + b + np.sqrt(np.maximum(2 * h * h - d * d, 0.0))))
+        u = np.where(edge, u, np.minimum(u, un))
+    return np.where(s, -u, u)
+
+
+def closing(g, F, r):
+    """Round every inside corner to at least radius r: crotches become soft U shapes."""
+    return redist(g, redist(g, F, r + 4.0) - r, r + 4.0) + r
+
+
+def tube(g, pts, radii, k=2.5):
+    """Rubber-hose limb: round cones chained through pts with the given radii."""
+    out = None
+    for (a, b, r1, r2) in zip(pts, pts[1:], radii, radii[1:]):
+        seg = round_cone(g, a, b, r1, r2 if abs(r1 - r2) > 1e-6 else r2 + 1e-6)
+        out = seg if out is None else smin(out, seg, k)
+    return out
+
+
+def limb(g, p0, p1, p2, radius):
+    """One unbroken curved limb: circles swept along the quadratic bezier p0-p1-p2,
+    with radius(t) giving the thickness from root (t=0) to tip (t=1)."""
+    n = int(3 * (math.hypot(p1[0] - p0[0], p1[1] - p0[1]) + math.hypot(p2[0] - p1[0], p2[1] - p1[1]))) + 8
+    out = None
+    for i in range(n + 1):
+        t = i / n
+        x = (1 - t) ** 2 * p0[0] + 2 * t * (1 - t) * p1[0] + t * t * p2[0]
+        y = (1 - t) ** 2 * p0[1] + 2 * t * (1 - t) * p1[1] + t * t * p2[1]
+        c = circle(g, (x, y), radius(t))
+        out = c if out is None else np.minimum(out, c)
+    return out
+
+
+def brush(g, pts, r, taper=0.5, r_end=0.38, lead=0.0):
+    """A brush line through pts (Catmull-Rom). It keeps radius r, then over the last
+    `taper` fraction of its length thins to r_end. taper=0 keeps it even end to end.
+    lead > 0 thins the first `lead` fraction the same way, for a line with two free ends."""
+    P = [pts[0]] + list(pts) + [pts[-1]]
+    samples = []
+    for i in range(1, len(P) - 2):
+        p0, p1, p2, p3 = P[i - 1], P[i], P[i + 1], P[i + 2]
+        n = int(4 * math.hypot(p2[0] - p1[0], p2[1] - p1[1])) + 4
+        for j in range(n):
+            t = j / n
+            t2, t3 = t * t, t * t * t
+            samples.append(tuple(0.5 * (2 * p1[k] + (-p0[k] + p2[k]) * t + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t2
+                                        + (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * t3) for k in (0, 1)))
+    samples.append(tuple(pts[-1]))
+    out = None
+    m = len(samples) - 1
+    for i, c in enumerate(samples):
+        t = i / m
+        u = 0.0 if taper <= 0 else min(1.0, max(0.0, (t - (1 - taper)) / taper))
+        if lead > 0:
+            u = max(u, min(1.0, max(0.0, (lead - t) / lead)))
+        rr = r + (r_end - r) * (u * u * (3 - 2 * u))
+        d = circle(g, c, rr)
+        out = d if out is None else np.minimum(out, d)
+    return out
+
+
+def stroke(g, p0, p1, p2, r0, r1):
+    """Brush stroke along a quadratic bezier p0-p1-p2, radius r0 tapering to r1."""
+    out = None
+    n = int(4 * (math.hypot(p1[0] - p0[0], p1[1] - p0[1]) + math.hypot(p2[0] - p1[0], p2[1] - p1[1]))) + 8
+    for i in range(n + 1):
+        t = i / n
+        x = (1 - t) ** 2 * p0[0] + 2 * t * (1 - t) * p1[0] + t * t * p2[0]
+        y = (1 - t) ** 2 * p0[1] + 2 * t * (1 - t) * p1[1] + t * t * p2[1]
+        r = r0 + (r1 - r0) * t ** 0.8
+        c = circle(g, (x, y), r)
+        out = c if out is None else np.minimum(out, c)
+    return out
 
 
 # ---------------------------------------------------------- marching squares
@@ -230,7 +337,8 @@ def path_d(g, F, level=0.0, min_area=0.6, tol=0.035):
         if abs(area) / 2 < min_area:
             continue
         pts = simplify(loop, tol)
-        out.append('M' + ' '.join('%s %s' % (fmt(x), fmt(y)) for x, y in pts) + 'Z')
+        k, ox, oy = XFORM
+        out.append('M' + ' '.join('%s %s' % (fmt(k * x + ox), fmt(k * y + oy)) for x, y in pts) + 'Z')
     return ''.join(out)
 
 

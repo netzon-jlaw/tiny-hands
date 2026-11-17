@@ -57,12 +57,15 @@ struct Ink {
     }
 }
 
-/// The pointer layer tree: pointer (at mouse) → sway (idle rock, pivot = fingertip)
-/// → body (tilt, anchor at tip) → stick (rod) + hand.
+/// The pointer layer tree: pointer (at mouse) → lean (the rod trailing behind a fast move,
+/// pivot = fingertip) → sway (idle rock, pivot = fingertip) → body (tilt, anchor at tip)
+/// → stick (rod) + hand.
 /// The stick is one long rod continuing the hand's axis out of the cuff: the drawn
 /// telescoping rod from stick.svg when it is bundled, otherwise a gradient that fades out.
 final class PointerLayers {
     let pointer = CALayer()
+    /// Zero-size layer at the fingertip. PointerMotion's swing rotates it.
+    let lean = CALayer()
     /// Zero-size layer at the fingertip. The idle sway rotates it, so the tip never
     /// leaves the mouse point.
     let sway = CALayer()
@@ -76,6 +79,8 @@ final class PointerLayers {
     var art: PointerArt?
     var ink = Ink(dark: false)
     private var frameIndex = 0
+    /// Which roll drawing is showing (0 = upright).
+    private var rollStep = 0
 
     /// Line boil + film grain: step to the next pre-rendered film frame.
     func advanceFrame() {
@@ -83,15 +88,34 @@ final class PointerLayers {
         frameIndex = (frameIndex + 1) % art.frames.count
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        hand.contents = art.frames[frameIndex]
+        showFrame(art)
         CATransaction.commit()
+    }
+
+    private func showFrame(_ art: PointerArt) {
+        let film = art.film(roll: rollStep)
+        hand.contents = film[frameIndex % film.count]
+    }
+
+    /// Shows the hand turned to `rollStep` and the whole pointer leaning by `swing` radians
+    /// about the fingertip. Call inside a transaction with actions disabled.
+    func setMotion(rollStep step: Int, swing: CGFloat) {
+        lean.transform = CATransform3DMakeRotation(swing, 0, 0, 1)
+        guard let art, step != rollStep else { return }
+        rollStep = step
+        showFrame(art)
+        // The cuff shifts a little as the hand turns; the rod follows it.
+        stick.position = art.wrist(roll: step)
     }
 
     init() {
         pointer.bounds = .zero
+        lean.bounds = .zero
+        lean.position = .zero
         sway.bounds = .zero
         sway.position = .zero
-        pointer.addSublayer(sway)
+        pointer.addSublayer(lean)
+        lean.addSublayer(sway)
         sway.addSublayer(body)
         body.addSublayer(stick)
         body.addSublayer(hand)
@@ -134,6 +158,8 @@ final class PointerLayers {
         hand.removeAnimation(forKey: "squash")
         hand.transform = CATransform3DIdentity
         hand.frame = body.bounds
+        rollStep = 0
+        lean.transform = CATransform3DIdentity
         hand.contents = art.image
         hand.contentsScale = contentsScale
         hand.contentsGravity = .resize
@@ -624,6 +650,12 @@ final class OverlayController {
     private var timer: Timer?
     private var boilTimer: Timer?
     private var lastLocation = CGPoint(x: -1, y: -1)
+    private var lastTick: CFTimeInterval = 0
+    /// Roll and swing of the pointer in response to being moved.
+    private var motion = PointerMotion()
+    /// Turn the hand and trail the rod when the pointer is flicked sideways. Off when the
+    /// user has asked the system to reduce motion.
+    var rollsWhenMoved: Bool { !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
     private var activeIndex = -1
     private(set) var isShown = false
     private var style: PointerStyle = .tinyHand
@@ -645,16 +677,19 @@ final class OverlayController {
     func configure(style: PointerStyle, scale: CGFloat) {
         self.style = style
         self.scale = scale
+        motion.reset()
         let ink = Ink.current
         for (i, p) in pointers.enumerated() {
             let backing = windows[i].screen?.backingScaleFactor ?? 2
-            p.apply(PointerArt.make(style: style, scale: scale, backing: backing), contentsScale: backing, ink: ink)
+            p.apply(PointerArt.make(style: style, scale: scale, backing: backing, rolling: true), contentsScale: backing, ink: ink)
         }
     }
 
     func show() {
         guard !isShown else { return }
         isShown = true
+        motion.reset()
+        lastTick = 0
         rebuildWindows()
         timer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.track() }
@@ -695,7 +730,7 @@ final class OverlayController {
             let p = PointerLayers()
             p.pointer.isHidden = true
             w.root.addSublayer(p.pointer)
-            p.apply(PointerArt.make(style: style, scale: scale, backing: screen.backingScaleFactor),
+            p.apply(PointerArt.make(style: style, scale: scale, backing: screen.backingScaleFactor, rolling: true),
                     contentsScale: screen.backingScaleFactor, ink: ink)
             p.setIdleSway(idleSway)
             w.orderFrontRegardless()
@@ -708,7 +743,19 @@ final class OverlayController {
 
     private func track(force: Bool = false) {
         let loc = NSEvent.mouseLocation
-        guard force || loc != lastLocation else { return }
+        let now = CACurrentMediaTime()
+        // Feed the motion every tick, moving or not: a spring keeps going after the cursor stops.
+        let wasResting = motion.isAtRest
+        let rolls = rollsWhenMoved
+        if !rolls, !wasResting { motion.reset() }
+        if rolls, lastTick > 0, lastLocation.x >= 0, !force {
+            let tilt = activeIndex >= 0 ? Double(pointers[activeIndex].art?.tilt ?? 0) : 0
+            motion.step(moved: CGVector(dx: loc.x - lastLocation.x, dy: loc.y - lastLocation.y),
+                        dt: now - lastTick, tilt: tilt)
+        }
+        lastTick = now
+        let moving = !(wasResting && motion.isAtRest)
+        guard force || moving || loc != lastLocation else { return }
         lastLocation = loc
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -721,6 +768,7 @@ final class OverlayController {
         if idx >= 0 {
             let f = windows[idx].frame
             pointers[idx].pointer.position = CGPoint(x: loc.x - f.minX, y: loc.y - f.minY)
+            pointers[idx].setMotion(rollStep: motion.rollStep, swing: CGFloat(motion.swing * .pi / 180))
         }
         CATransaction.commit()
     }

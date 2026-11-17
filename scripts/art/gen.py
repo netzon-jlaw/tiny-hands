@@ -1,6 +1,21 @@
-"""Generate the moulded-plastic toy pointer SVGs for Tiny Hands.
+"""Generate the ink-and-paint pointer SVGs for Tiny Hands.
 
-Usage: python3 gen.py OUTDIR [names...]
+The toy hand, drawn the way a 1930s rubber-hose cartoon would draw it. Each hand is
+one continuous outline: club-tipped fingers that bow and flow into a round hand,
+stubs for the folded fingers, a pinch at the wrist and a soft rolled cuff. One even
+warm-black line, flat cel paint, nothing else.
+
+Every hand is a right hand seen from above with the palm down, the way the toy looks
+when it taps a screen: we see the back of the hand. A folded finger shows as a short
+stub (knuckle to first joint) with its tip hidden underneath, so the only inner lines
+are the seams between neighbouring fingers. No finger pads or palm creases can show.
+
+The hands are modelled with depth, so the same drawing can be turned about its long
+axis. Besides the three line-boil frames, each hand gets eight "roll" frames (the hand
+turned 11, 22, 33 and 44 degrees each way), which the app shows when the pointer is
+flicked sideways.
+
+Usage: /usr/bin/python3 gen.py OUTDIR [names...]     (needs numpy)
 """
 import math
 import os
@@ -8,413 +23,432 @@ import sys
 
 import numpy as np
 
-from sdfart import (Grid, circle, ellipse, capsule, rbox, finger, smin, sunion,
-                    path_d, band, inter, mix, shade, fmt)
+import sdfart
+from sdfart import (Grid, circle, ellipse, capsule, limb, brush, smin, sunion, rbox,
+                    path_d, contours, inter, mix, redist, closing)
 
-LX, LY = -0.5, -0.866  # direction towards the light (outward normal facing it)
-OUTLINE = 1.0          # outline thickness outside the fill, viewBox units
+INK = '#1B1410'      # same ink as the app's tap effects
+CLAW = '#F6ECD2'     # cat claws
+T0, TA = 2.05, 0.35  # ink weight outside the paint: base, plus a little extra on the lower right
+SHX, SHY = 0.55, 0.835
+LINE = 1.12          # radius of an inner brush line: the same weight as the outline
+DART = 0.95          # radius of a dart line: a touch lighter
+TOP, BOTTOM = 2.0, 138.0   # where the inked art must start and end in the viewBox
+MARGIN = 1.5               # the boil frames need this much room at the sides
+ROUND = 3.6                # every inside corner of the outline is opened up to at least this radius
+ROLL_STEP = 11.0           # degrees between roll frames
+ROLL_MAX = 4               # roll frames each way
 
 
-# --------------------------------------------------------------- palettes
-def palette(base, outline=None, warm=0.06):
-    base = mix(base, '#EBD9BC', warm)
-    return {
-        'base': base,
-        'light': mix(base, '#F4FFF0', 0.45),
-        'hi': mix(base, '#FFFFFF', 0.25),
-        'shade': shade(base, 0.70),
-        'deep': shade(base, 0.52),
-        'rim': mix(base, '#FFFBEA', 0.38),
-        'outline': outline or shade(base, 0.46),
-    }
+def paint(base):
+    # aged cel paint: every colour pulled toward a warm cream
+    return mix(base, '#E9D7B2', 0.22)
+
+
+# ------------------------------------------------------------- the third dimension
+# Drawing units: x right, y down, z toward the camera (up off the back of the hand).
+# A roll turns the hand about a vertical axis through the fingertip, so the tip never
+# moves. Positive roll carries the top of the hand to the right.
+class View:
+    def __init__(self, degrees, axis_x):
+        self.t = math.radians(degrees)
+        self.c, self.s = math.cos(self.t), math.sin(self.t)
+        self.ax = axis_x
+
+    def x(self, x, z=0.0):
+        return self.ax + (x - self.ax) * self.c + z * self.s
+
+    def p(self, pt, z=0.0):
+        return (self.x(pt[0], z), pt[1])
+
+    def width(self, rx, rz):
+        """Half-width of something rx wide and rz deep, seen turned."""
+        return math.hypot(rx * self.c, rz * self.s)
+
+    def faces(self, phi):
+        """Is the surface point at angle phi round a vertical cylinder (0 = top) turned toward us?"""
+        return math.cos(phi + self.t) > 0.0
+
+
+V = View(0.0, 50.0)
+
+
+def ball(g, c, rx, ry, rz, z=0.0, rot=0.0):
+    return ellipse(g, V.p(c, z), V.width(rx, rz), ry, rot)
+
+
+def knob(g, c, r, z=0.0):
+    return circle(g, V.p(c, z), r)
+
+
+def digit(g, base, ctrl, tip, r, root=0.88, z=(0.0, 0.0, 0.0)):
+    """A cartoon finger: a sausage that bows along base-ctrl-tip and swells a little toward a round tip of radius r."""
+    return limb(g, V.p(base, z[0]), V.p(ctrl, z[1]), V.p(tip, z[2]), lambda t: r * (root + (1 - root) * t ** 0.8))
 
 
 # ----------------------------------------------------------------- shapes
+WRIST_R = 15.0
+CUFF_R = 24.0
+
+
+class Part:
+    """Something drawn in front of the hand's main shape with its own ink line: a raised
+    finger, a folded finger's stub, a toe. Its line fades out toward `root` (fully gone
+    within r0, full weight beyond r1), so the part grows out of the hand there, and what is
+    left of the line is the seam between it and its neighbour. Parts are painted far to
+    near, so when the hand turns the nearer finger overlaps the next with one clean line."""
+    def __init__(self, sdf, root, r0, r1, x):
+        self.sdf, self.root, self.r0, self.r1, self.x = sdf, root, r0, r1, x
+
+
 def cuff(g):
-    # fat rolled cuff: a short cylinder with softly rounded rims
-    a = rbox(g, (50, 120.25), 31.5, 16.25, 9.5)
-    b = ellipse(g, (50, 120.25), 32.2, 16.75)
-    return smin(a, b, 3.0)
+    # a narrow rolled cuff, like the band on a 1930s cartoon glove: a little fuller on one side
+    return smin(ball(g, (49.7, 126.6), 25.4, 10.7, 22.0), rbox(g, V.p((50.3, 126.3)), V.width(24.2, 21.0), 9.9, 9.8), 3.0)
 
 
-def palm_shape(g, cx=53.0, cy=76.0, hx=29.0, hy=24.0):
-    upper = rbox(g, (cx, cy), hx, hy, 20)
-    wrist = capsule(g, (cx - 2.5, cy + 14), (cx - 2.5, cy + 26), 24.5)
-    return smin(upper, wrist, 6)
+def darts(cx, y0, y1, spread=6.6):
+    """The three short lines on the back of a cartoon glove: mid-back, clear of the outline,
+    running from the knuckles toward the wrist and fanning a little."""
+    out = []
+    for i in (-1, 0, 1):
+        ym = (y0 + y1) / 2
+        out.append([(cx + i * spread * 1.12, y0 + abs(i) * 1.2), (cx + i * spread * 1.0, ym), (cx + i * spread * 0.86, y1 - abs(i) * 0.6)])
+    return out
+
+
+def finger(g, base, ctrl, tip, r, root=0.88, reach=1.0):
+    """A raised finger as a Part: its sides run on into the hand as seams, fading toward its root."""
+    sdf = digit(g, base, ctrl, tip, r, root)
+    return Part(sdf, V.p(base), r * 1.15 * reach, r * 1.5 * reach, base[0])
+
+
+def stub(g, c, r, toward, reach=1.0):
+    """A folded finger seen from the back: a round stub. `toward` is the middle of the hand;
+    the stub's line fades out in that direction."""
+    d = math.hypot(toward[0] - c[0], toward[1] - c[1])
+    root = (c[0] + (toward[0] - c[0]) / d * r * 0.95, c[1] + (toward[1] - c[1]) / d * r * 0.95)
+    return Part(knob(g, c, r), V.p(root), r * 1.2 * reach, r * 1.5 * reach, c[0])
+
+
+def build_hand(g, palm, parts, extra=(), k=6.0, crotch=6.0, bump_k=3.0):
+    """One continuous silhouette: fingers flow into the hand, folded fingers bump the outline,
+    the wrist pinches in and the cuff swells out below it. As the hand turns and fingers
+    close up, the webbing between them is let go, so they overlap instead of fusing."""
+    crotch = crotch * V.c ** 3
+    limbs = [p.sdf for p in parts if not getattr(p, 'is_stub', False)] + list(extra)
+    stubs = [p.sdf for p in parts if getattr(p, 'is_stub', False)]
+    body = smin(palm, sunion(crotch, *limbs), k) if limbs else palm
+    if stubs:
+        body = smin(body, sunion(0, *stubs), bump_k)
+    neck = capsule(g, V.p((50, 100)), V.p((50, 122)), WRIST_R)
+    return smin(smin(body, neck, 7.0), cuff(g), 1.5)
+
+
+def cuff_lines():
+    """The seam where the wrist goes into the cuff: the same arc in every drawing, from one
+    wrist pinch to the other. And a short crease tick on each side of the roll; the ticks
+    travel round the cuff as the hand turns, and one goes out of sight."""
+    cx = V.x(50)
+    seam = [(cx + dx, 115.6 + 4.6 * (1 - (dx / 18.0) ** 2)) for dx in (-18, -12, -6, 0, 6, 12, 18)]
+    out = [(seam, 0.0, LINE)]
+    for a in (-60, 60):
+        phi = math.radians(a)
+        if math.cos(phi + V.t) < 0.22:
+            continue
+        x = V.x(50 + CUFF_R * math.sin(phi), CUFF_R * math.cos(phi))
+        lean = math.sin(phi + V.t)
+        out.append(([(x + lean * 2.6, 124.0), (x + lean * 0.9, 126.2), (x - lean * 0.6, 128.6)], -0.3, DART))
+    return out
+
+
+def tucked_thumb(g):
+    """A thumb folded under the fist. It lies below the hand, so from above only the part
+    that sticks out past the left edge shows, as a lobe; turn the hand left and it slides
+    out of sight underneath."""
+    return limb(g, V.p((31, 96), -5), V.p((25.5, 89), -5), V.p((28, 79), -5), lambda t: 9.2 - 1.8 * t)
+
+
+OUT_THUMB_Z = (-2.0, -3.0, -4.0)   # a thumb held out sits a little lower than the back of the hand
+
+
+def mark_stubs(*parts):
+    for p in parts:
+        p.is_stub = True
+    return list(parts)
 
 
 def hand_pointing(g):
-    palm = palm_shape(g)
-    bump = capsule(g, (58.5, 53.5), (71, 58), 12.0)
-    body = smin(palm, bump, 6)
-    index = finger(g, (40.5, 66), (40, 14), 11.0, 8.7, 11.0, k=3.5)
-    thumb = finger(g, (40, 86), (11.6, 75), 10.0, 7.9, 9.1, k=3.0)
-    body = smin(body, index, 4.5)
-    body = smin(body, thumb, 4.0)
-    return body
+    palm = ball(g, (53, 85), 26, 26, 14)
+    index = finger(g, (44, 70), (38.5, 44), (42, 19), 10.0)
+    thumb = digit(g, (37, 83), (25.5, 81), (15, 70.5), 9.2, z=OUT_THUMB_Z)
+    # The two folded fingers root on the same knuckle row as the index, so their stubs sit
+    # side by side to its right, stepping down.
+    stubs = mark_stubs(stub(g, (61.5, 62.5), 9.6, (55, 82)), stub(g, (74, 69.5), 8.6, (60, 84)))
+    parts = [index] + stubs
+    return {'base': build_hand(g, palm, parts, extra=[thumb], crotch=10.0, bump_k=4.0),
+            'palm': (53, 26, 14), 'parts': parts, 'darts': darts(56, 82, 95)}
 
 
 def hand_middle(g):
-    palm = rbox(g, (50, 80), 27.5, 31, 17)
-    lb = capsule(g, (30, 55), (38, 52), 9.8)
-    rb = capsule(g, (62, 52), (71, 56), 10.0)
-    body = sunion(6, palm, lb, rb)
-    mid = finger(g, (50, 62), (50, 12), 8.6, 7.0, 9.0, k=3.0)
-    thumb = finger(g, (38, 88), (12.5, 77), 9.0, 7.2, 8.4, k=3.0)
-    body = smin(body, mid, 4.0)
-    body = smin(body, thumb, 4.0)
-    return body
+    palm = ball(g, (50, 86), 26, 26, 14)
+    mid = finger(g, (50, 70), (53.5, 44), (50, 18.5), 9.2)
+    # one folded finger on each side of the raised one
+    stubs = mark_stubs(stub(g, (36.5, 63.5), 9.2, (46, 82)), stub(g, (64, 65), 9.4, (54, 82)))
+    parts = [stubs[0], mid, stubs[1]]
+    return {'base': build_hand(g, palm, parts), 'under': tucked_thumb(g),
+            'palm': (50, 26, 14), 'parts': parts, 'darts': darts(52, 82, 95)}
 
 
 def hand_peace(g):
-    palm = rbox(g, (52, 81), 27, 30, 17)
-    rb = capsule(g, (66, 58), (73, 63), 9.5)
-    body = smin(palm, rb, 6)
-    index = finger(g, (44, 62), (36, 11.5), 8.2, 6.7, 8.5, k=3.0)
-    mid = finger(g, (57, 62), (63, 16.5), 8.2, 6.7, 8.5, k=3.0)
-    thumb = finger(g, (37, 88), (14, 74), 7.6, 5.9, 7.4, k=2.5)
-    vee = smin(index, mid, 9.0)  # moulded web at the bottom of the V
-    body = smin(body, vee, 4.5)
-    body = smin(body, thumb, 4.0)
-    return body
+    palm = ball(g, (51, 86), 25.5, 26, 14)
+    index = finger(g, (45, 72), (34.5, 49), (31, 21.5), 8.8)
+    mid = finger(g, (58, 72), (68.8, 51), (70.5, 25.5), 8.8)
+    stubs = mark_stubs(stub(g, (70.5, 74), 10.0, (56, 86)))
+    parts = [index, mid] + stubs
+    return {'base': build_hand(g, palm, parts, crotch=7.0), 'under': tucked_thumb(g),
+            'palm': (51, 25.5, 14), 'parts': parts, 'darts': darts(52.5, 83, 96)}
 
 
 def hand_thumbs(g):
-    fist = rbox(g, (48, 80), 24, 26, 18)
-    wrist = capsule(g, (50, 96), (50, 106), 24.5)
-    body = sunion(6, fist, wrist)
-    # curled fingers: fat rolls stacked down the front, scalloping the right edge
-    for y, x1, r in ((56.5, 74.5, 9.6), (74.5, 78.5, 9.4), (91.5, 76.5, 9.0)):
-        body = smin(body, capsule(g, (50, y), (x1, y + 1.0), r), 2.6)
-    thumb = finger(g, (40, 66), (36, 15), 12.8, 10.6, 12.0, k=3.5)
-    body = smin(body, thumb, 6.0)
-    return body
+    palm = ball(g, (53, 86), 25, 26, 14)
+    # The thumb roots low on the side of the hand, as thumbs do, and stands up leaning out:
+    # shorter and fatter than a finger. The three folded fingers root on the knuckle row
+    # across the top, so their stubs sit in a row to its right, stepping down, exactly as on
+    # the pointing hand.
+    thumb = finger(g, (38, 88), (28.5, 69), (22, 45), 12.6, root=0.74, reach=0.9)
+    stubs = mark_stubs(stub(g, (48, 61.5), 8.6, (52, 82)), stub(g, (60.5, 63.5), 8.4, (56, 82)),
+                       stub(g, (71.5, 69.5), 7.6, (60, 84)))
+    parts = [thumb] + stubs
+    return {'base': build_hand(g, palm, parts, crotch=8.0, bump_k=4.0),
+            'palm': (53, 25, 14), 'parts': parts, 'darts': darts(55, 83, 96)}
 
 
 def hand_rock(g):
-    palm = rbox(g, (51, 81), 27.5, 30, 17)
-    mb = capsule(g, (46, 56), (60, 56), 10.0)
-    body = smin(palm, mb, 6)
-    index = finger(g, (36, 62), (34, 11.5), 8.2, 6.7, 8.5, k=3.0)
-    pinky = finger(g, (68, 62), (72, 21), 7.4, 6.0, 7.6, k=3.0)
-    body = smin(body, index, 6.5)
-    body = smin(body, pinky, 6.5)
-    return body
+    palm = ball(g, (51, 86), 26, 26, 14)
+    index = finger(g, (39, 72), (29.5, 49), (31.5, 21), 8.6)
+    pinky = finger(g, (65, 74), (74.5, 54), (73, 31.5), 7.6)
+    # one folded finger between the two raised ones: a single stub
+    stubs = mark_stubs(stub(g, (52.2, 63.5), 9.2, (52, 82)))
+    parts = [index] + stubs + [pinky]
+    return {'base': build_hand(g, palm, parts, crotch=4.0), 'under': tucked_thumb(g),
+            'palm': (51, 26, 14), 'parts': parts, 'darts': darts(53, 83, 96)}
 
 
 def hand_five(g):
-    palm = rbox(g, (52, 82), 27.5, 29, 18)
-    idx = finger(g, (38, 64), (27.5, 21.5), 7.4, 6.0, 7.4, k=3.0)
-    mid = finger(g, (50.5, 60), (50, 10.8), 7.6, 6.2, 7.8, k=3.0)
-    ring = finger(g, (62, 64), (71.5, 21.5), 7.3, 5.9, 7.3, k=3.0)
-    pinky = finger(g, (71, 74), (88, 42), 6.6, 5.4, 6.6, k=3.0)
-    thumb = finger(g, (34, 88), (12, 66), 7.6, 5.9, 7.4, k=2.5)
-    fingers = idx
-    for f in (mid, ring, pinky):
-        fingers = smin(fingers, f, 9.0)  # moulded webs between the fingers
-    body = smin(palm, fingers, 4.0)
-    body = smin(body, thumb, 4.0)
-    return body
+    # a cartoon hand: three fat fingers and a thumb
+    palm = ball(g, (52, 87), 26, 25, 14)
+    index = finger(g, (38, 73), (26, 55), (23.5, 33.5), 8.8)
+    mid = finger(g, (52, 70), (57, 44.5), (52.5, 19.5), 9.2)
+    ring = finger(g, (67, 75), (80.5, 58), (83, 38.5), 8.5)
+    thumb = digit(g, (36, 86), (24.5, 84.5), (13.5, 73.5), 8.6, z=OUT_THUMB_Z)
+    parts = [index, mid, ring]
+    return {'base': build_hand(g, palm, parts, extra=[thumb], crotch=7.0),
+            'palm': (52, 26, 14), 'parts': parts, 'darts': darts(53.5, 83, 96)}
 
 
 def paw(g):
-    pad = rbox(g, (50, 66), 33, 40, 30)
-    toes = sunion(2.0, circle(g, (22, 31), 9.4), circle(g, (40, 13.6), 10.6),
-                  circle(g, (61, 16.0), 10.4), circle(g, (79, 33), 9.4))
-    return smin(pad, toes, 5.0)
+    # the top of a cat's paw: a fat mitt with four toes, and a fat hooked claw on each
+    cheeks = smin(ball(g, (50, 82), 33, 26, 22), ball(g, (50, 62), 29, 20, 19), 10.0)
+    toes = [((24.5, 54.5), 10.6, 12.6, -32), ((39.6, 37.5), 11.4, 14.6, -10),
+            ((60.4, 40.4), 11.2, 14.2, 10), ((75.5, 56), 10.6, 12.4, 32)]
+    parts, claws = [], []
+    for c, rx, ry, rot in toes:
+        p = Part(ellipse(g, V.p(c), rx, ry, rot), V.p((c[0] * 0.55 + 22.5, c[1] + ry * 1.05)), rx * 0.6, rx * 1.9, c[0])
+        parts.append(p)
+        # the claw points forward out of the middle of its toe; the outer pair splay only a little
+        a = math.radians(max(-20.0, min(20.0, rot)))
+        ux, uy = math.sin(a), -math.cos(a)
+        top = (c[0] + math.sin(math.radians(rot)) * ry * 0.9, c[1] - math.cos(math.radians(rot)) * ry * 0.9)
+        hook = -1.0 if c[0] < 50 else 1.0
+        root = (top[0] - ux * 2.5, top[1] - uy * 2.5)
+        mid = (top[0] + ux * 3.4 + hook * 0.3, top[1] + uy * 3.4)
+        tip = (top[0] + ux * 7.4 + hook * 1.9, top[1] + uy * 7.4 + 0.6)
+        # the claws stay level with the roll axis, so the tallest claw's tip (the hotspot) never moves
+        claws.append(limb(g, V.p(root), V.p(mid), V.p(tip), lambda t: 3.9 - 2.9 * t ** 1.3))
+    return {'base': build_hand(g, cheeks, parts, k=5.0, crotch=0.0),
+            'round': 3.0, 'palm': (50, 33, 22), 'parts': parts,
+            'under': sunion(0, *claws), 'under_paint': CLAW, 'under_min': -1e9,
+            'darts': darts(50, 78, 91, 7.4)}
 
 
-TOE_BEANS = [((23, 32.6), 4.3, 5.0, -25), ((40.2, 15.8), 5.0, 5.8, -6),
-             ((60.6, 18.2), 4.9, 5.7, 6), ((77.8, 34.6), 4.3, 5.0, 25)]
-
-
-def paw_beans(g):
-    main = sunion(5.0, ellipse(g, (50, 72), 15, 10), circle(g, (38.5, 80), 7.2),
-                  circle(g, (50, 84.5), 7.6), circle(g, (61.5, 80), 7.2))
-    beans = [ellipse(g, c, rx, ry, rot) for c, rx, ry, rot in TOE_BEANS]
-    return main, beans
-
-
+# name: (shape fn, fingertip (x, y) in drawing units, paint colour)
 VARIETIES = {
-    # name: (shape fn, tip (x, y), palette base, outline override)
-    'tiny-hand': (hand_pointing, (40.0, 2.0), '#22B593', None),
-    'middle-child': (hand_middle, (50.0, 2.0), '#3F8FBE', None),
-    'peace': (hand_peace, (36.0, 2.0), '#A28BD0', None),
-    'thumbs-up': (hand_thumbs, (36.0, 2.0), '#F2C64A', '#94701E'),
-    'rock-on': (hand_rock, (34.0, 2.0), '#62B36A', None),
-    'high-five': (hand_five, (50.0, 2.0), '#F299AC', None),
-    'cat-paw': (paw, (40.0, 2.0), '#9DCDE8', None),
+    'tiny-hand': (hand_pointing, (42.0, 9.0), '#2BBF9F'),
+    'middle-child': (hand_middle, (50.0, 9.3), '#4490C2'),
+    'peace': (hand_peace, (31.0, 12.7), '#A489D2'),
+    'thumbs-up': (hand_thumbs, (22.0, 32.4), '#F2C03C'),
+    'rock-on': (hand_rock, (31.5, 12.4), '#63B25F'),
+    'high-five': (hand_five, (52.5, 10.3), '#EE889E'),
+    'cat-paw': (paw, (34.0, 16.6), '#95C6E6'),
 }
 
 
 # ------------------------------------------------------------------ boil
-def boil_noise(g, seed, amp, keep_pts):
-    if seed == 0:
-        return 0.0
+def noise(g, seed, amp, keep_pts=(), lo=0.10, hi=0.22):
     rng = np.random.default_rng(seed)
     n = np.zeros_like(g.X)
     for _ in range(4):
         ang = rng.uniform(0, math.pi)
-        f = rng.uniform(0.10, 0.22)
+        f = rng.uniform(lo, hi)
         ph = rng.uniform(0, 2 * math.pi)
         n += np.sin(f * (g.X * math.cos(ang) + g.Y * math.sin(ang)) + ph)
-    n = n / 2.0 * amp
-    mask = np.ones_like(n)
+    n = np.clip(n / 2.0 * amp, -amp, amp)
     for (px, py, r0, r1) in keep_pts:
-        d = np.hypot(g.X - px, g.Y - py)
-        mask *= np.clip((d - r0) / (r1 - r0), 0, 1)
-    return np.clip(n, -amp, amp) * mask
+        n = n * np.clip((np.hypot(g.X - px, g.Y - py) - r0) / (r1 - r0), 0, 1)
+    return n
 
 
 # ---------------------------------------------------------------- render
 class SVG:
     def __init__(self, w, h):
         self.w, self.h = w, h
-        self.defs = []
         self.body = []
 
-    def lin(self, gid, x1, y1, x2, y2, stops, units=None):
-        u = ' gradientUnits="userSpaceOnUse"' if units == 'user' else ''
-        s = ''.join('<stop offset="%s" stop-color="%s"%s/>' % (
-            fmt(o), c, '' if a >= 1 else ' stop-opacity="%s"' % fmt(a)) for o, c, a in stops)
-        self.defs.append('<linearGradient id="%s" x1="%s" y1="%s" x2="%s" y2="%s"%s>%s</linearGradient>'
-                         % (gid, fmt(x1), fmt(y1), fmt(x2), fmt(y2), u, s))
-
-    def rad(self, gid, cx, cy, r, stops, fx=None, fy=None, units=None):
-        u = ' gradientUnits="userSpaceOnUse"' if units == 'user' else ''
-        f = '' if fx is None else ' fx="%s" fy="%s"' % (fmt(fx), fmt(fy))
-        s = ''.join('<stop offset="%s" stop-color="%s"%s/>' % (
-            fmt(o), c, '' if a >= 1 else ' stop-opacity="%s"' % fmt(a)) for o, c, a in stops)
-        self.defs.append('<radialGradient id="%s" cx="%s" cy="%s" r="%s"%s%s>%s</radialGradient>'
-                         % (gid, fmt(cx), fmt(cy), fmt(r), f, u, s))
-
-    def path(self, d, fill, opacity=1.0):
-        if not d:
-            return
-        op = '' if opacity >= 1 else ' fill-opacity="%s"' % fmt(opacity)
-        self.body.append('<path d="%s" fill="%s"%s/>' % (d, fill, op))
-
-    def ellipse(self, cx, cy, rx, ry, fill, opacity=1.0, rot=0.0):
-        op = '' if opacity >= 1 else ' fill-opacity="%s"' % fmt(opacity)
-        el = '<ellipse cx="0" cy="0" rx="%s" ry="%s" fill="%s"%s/>' % (fmt(rx), fmt(ry), fill, op)
-        if rot:
-            self.body.append('<g transform="translate(%s %s) rotate(%s)">%s</g>' % (fmt(cx), fmt(cy), fmt(rot), el))
-        else:
-            self.body.append('<ellipse cx="%s" cy="%s" rx="%s" ry="%s" fill="%s"%s/>' % (
-                fmt(cx), fmt(cy), fmt(rx), fmt(ry), fill, op))
+    def path(self, d, fill):
+        if d:
+            self.body.append('<path d="%s" fill="%s"/>' % (d, fill))
 
     def text(self):
         return ('<?xml version="1.0" encoding="UTF-8"?>\n'
                 '<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="%d" height="%d" viewBox="0 0 %d %d">\n'
-                '<defs>\n%s\n</defs>\n%s\n</svg>\n' % (self.w, self.h, self.w, self.h,
-                                                       '\n'.join(self.defs), '\n'.join(self.body)))
+                '%s\n</svg>\n' % (self.w, self.h, self.w, self.h, '\n'.join(self.body)))
 
 
-def shade_part(svg, g, S, P, gid, kind, rng, boil):
-    """Moulded plastic shading for one merged part with field S."""
+def ink_weight(g, S, wobble):
+    """A brush line: a touch heavier on the lower right, with a slow wobble."""
     nx, ny = g.normals(S)
-    # base fill
-    if kind == 'cuff':
-        svg.lin(gid, 0, 0, 0, 1, [(0, P['light'], 1), (0.28, P['base'], 1), (0.7, P['shade'], 1), (1, P['deep'], 1)])
-    else:
-        svg.lin(gid, 0.1, 0.0, 0.75, 1.0, [(0, P['base'], 1), (0.55, P['base'], 1), (1, P['shade'], 1)])
-    svg.path(path_d(g, S), 'url(#%s)' % gid)
-    # bottom-right occlusion: a dark band hugging the shadow-side edge
-    wdark = np.clip(-(nx * LX + ny * LY), 0, 1) ** 1.2
-    for wd, op in ((6.5, 0.16), (3.6, 0.18), (1.6, 0.18)):
-        svg.path(path_d(g, band(S, -0.3, wd * wdark + 0.3)), P['deep'], op)
-    # soft lit volume: shrunk copies pushed toward the light
-    K = 9
-    for k in range(1, K + 1):
-        r = 1.25 * k
-        v = 0.7 * r
-        sh = g.shift(S, -LX * v, -LY * v)
-        svg.path(path_d(g, sh + r), P['light'], 0.055)
-    if kind == 'cuff':
-        wtop = np.clip(-ny, 0, 1) ** 3
-        svg.path(path_d(g, band(S, 0.6, 3.2 * wtop)), P['light'], 0.35)
-    # rim / bounce light on the underside, inset from the edge
-    wrim = np.clip(nx * 0.25 + ny * 0.97, 0, 1) ** 2.0
-    j = rng.uniform(-0.15, 0.15) if boil else 0.0
-    svg.path(path_d(g, band(S, 0.9 + j, 1.5 * wrim)), P['rim'], 0.55)
-    # specular streak on the lit edge
-    dl = nx * LX + ny * LY
-    lap = (np.gradient(np.gradient(S, g.h, axis=0), g.h, axis=0)
-           + np.gradient(np.gradient(S, g.h, axis=1), g.h, axis=1))
-    curv = np.clip((lap - 0.045) / 0.05, 0, 1)
-    wsp = np.clip((dl - 0.55) / 0.45, 0, 1) ** 1.3 * curv
-    j = rng.uniform(-0.25, 0.25) if boil else 0.0
-    svg.path(path_d(g, band(S, 1.7 + j, (2.4 + j) * wsp)), '#FFFFFF', 0.85)
+    return T0 + TA * np.clip(nx * SHX + ny * SHY, 0, 1) ** 1.4 + wobble
 
 
-def inside_ok(S_at, cx, cy, rx, ry, rot=0.0, margin=0.8):
-    ca, sa = math.cos(math.radians(rot)), math.sin(math.radians(rot))
-    for t in np.linspace(0, 2 * math.pi, 48, endpoint=False):
-        x = cx + rx * math.cos(t) * ca - ry * math.sin(t) * sa
-        y = cy + rx * math.cos(t) * sa + ry * math.sin(t) * ca
-        if S_at(x, y) > -margin:
-            return False
-    return True
+FIT = {}
+TIPX = {}
 
 
-def sampler(g, S):
-    def at(x, y):
-        j = (x - g.x0) / g.h
-        i = (y - g.y0) / g.h
-        j0, i0 = int(math.floor(j)), int(math.floor(i))
-        tj, ti = j - j0, i - i0
-        return (S[i0, j0] * (1 - tj) * (1 - ti) + S[i0, j0 + 1] * tj * (1 - ti)
-                + S[i0 + 1, j0] * (1 - tj) * ti + S[i0 + 1, j0 + 1] * tj * ti)
-    return at
-
-
-GLINTS = {
-    # extra crisp glints and soft glows per variety: (kind, cx, cy, rx, ry, rot)
-    'tiny-hand': [('glow', 49, 76, 17, 16, -20), ('glow', 64, 51, 8, 5, -12),
-                  ('dot', 34.6, 11.6, 1.9, 3.4, 25), ('dot', 62.0, 47.0, 3.6, 1.35, -18),
-                  ('dot', 7.0, 71.6, 1.3, 2.1, 40), ('dot', 33.0, 63, 1.0, 3.2, 12)],
-    'middle-child': [('glow', 47, 72, 15, 17, -20), ('glow', 33, 52, 6, 4, -15), ('glow', 66, 52, 6, 4, -10),
-                     ('dot', 45.5, 10.5, 1.6, 3.0, 25), ('dot', 30, 46.8, 2.6, 1.1, -20),
-                     ('dot', 63, 45.5, 2.8, 1.2, -12), ('dot', 8.6, 74.6, 1.2, 2.0, 40)],
-    'peace': [('glow', 48, 74, 15, 16, -20), ('dot', 31.6, 10.0, 1.5, 2.8, 30),
-              ('dot', 58.8, 14.6, 1.4, 2.6, 10), ('dot', 67, 52.5, 2.5, 1.1, -25),
-              ('dot', 10.8, 71.2, 1.2, 1.8, 40)],
-    'thumbs-up': [('glow', 44, 80, 13, 15, -20), ('glow', 66, 53, 8, 4, 0), ('glow', 70, 71, 8, 4, 0),
-                  ('dot', 30.0, 12.0, 2.0, 3.6, 22), ('dot', 70, 50.4, 3.6, 1.2, -4),
-                  ('dot', 74, 68.2, 3.0, 1.1, -4), ('dot', 72, 85.8, 2.6, 1.0, -4),
-                  ('dot', 29.4, 40, 1.2, 4.6, 4)],
-    'rock-on': [('glow', 48, 74, 15, 16, -20), ('glow', 52, 52, 8, 4, -5),
-                ('dot', 29.6, 10.0, 1.5, 2.8, 25), ('dot', 68.4, 19.3, 1.3, 2.4, 20),
-                ('dot', 50, 49.2, 3.0, 1.2, -6)],
-    'high-five': [('glow', 50, 80, 15, 15, -20), ('dot', 24.4, 19.4, 1.3, 2.5, 40),
-                  ('dot', 46.4, 9.4, 1.4, 2.6, 25), ('dot', 68.2, 18.8, 1.3, 2.4, 15),
-                  ('dot', 85.6, 39.4, 1.0, 1.9, 30), ('dot', 9.6, 63.5, 1.1, 1.8, 45)],
-    'cat-paw': [('glow', 47, 58, 17, 13, -15), ('dot', 34.6, 8.6, 1.6, 2.8, 40),
-                ('dot', 56.6, 11.4, 1.4, 2.4, 30), ('dot', 17.4, 26.8, 1.3, 2.2, 45),
-                ('dot', 74.8, 28.4, 1.2, 2.0, 30)],
-}
-CUFF_GLINTS = [('dot', 27.5, 108.6, 5.8, 1.5, -10), ('dot', 21.4, 119.5, 1.1, 3.6, 0),
-               ('glow', 44, 110, 15, 4.8, -3)]
-
-
-def build(name, seed=0, out=None):
-    shape_fn, tip, base, ol = VARIETIES[name]
-    P = palette(base, ol)
-    g = Grid(-1, -1, 101, 141)
-    body = shape_fn(g)
-    cf = cuff(g)
+def build(name, seed=0, roll=0):
+    """One frame: seed picks the line-boil variant, roll the turn (in steps of ROLL_STEP degrees)."""
+    global V
+    shape_fn, tip, colour = VARIETIES[name]
+    base_paint = paint(colour)
+    V = View(roll * ROLL_STEP, tip[0])
+    g = Grid(-6, -6, 106, 146)
+    hand = shape_fn(g)
+    base = hand['base']
+    under = hand.get('under')
+    parts = hand.get('parts', [])
     rng = np.random.default_rng(1000 + seed)
+    # points the boil must leave alone: the fingertip and the cuff bottom
+    keep = [(tip[0], tip[1], 12.0, 22.0), (50, 137, 8.0, 16.0)]
     if seed:
-        keep = [(tip[0], tip[1] + 1, 7.0, 15.0), (50, 137, 6.0, 14.0)]
-        # also hold the left/right extremes so bounds stay put
-        S0 = np.minimum(body, cf)
-        ins = S0 < OUTLINE
-        cols = np.nonzero(ins.any(axis=0))[0]
-        for cj in (cols[0], cols[-1]):
-            rows = np.nonzero(ins[:, cj])[0]
-            keep.append((g.x0 + cj * g.h, g.y0 + rows.mean() * g.h, 4.0, 10.0))
-        body = body + boil_noise(g, seed, 0.7, keep)
-        cf = cf + boil_noise(g, seed + 50, 0.5, keep)
+        wob = noise(g, seed, 0.3, keep)
+        base = base + wob
+        if under is not None:
+            under = under + wob
+        for p in parts:
+            p.sdf = p.sdf + wob
+    # webbing and rounding are let go as the fingers close up, so they overlap rather than fuse
+    whole = closing(g, base, hand.get('round', ROUND) * (0.4 + 0.6 * V.c ** 2))
+    wobble = noise(g, 300 + seed, 0.14 if seed else 0.08, keep, 0.05, 0.12)
+    weight = ink_weight(g, whole, wobble)
+    ink = whole - weight
+    if under is not None:
+        under = redist(g, under)
+        # A tucked thumb only counts if enough of it shows. A strip thinner than the ink line
+        # would just make the outline look heavy there, so it is left out. (Claws always stay.)
+        showing = np.minimum(-under, ink)
+        if showing.max() < hand.get('under_min', 1.3):
+            under = None
+        else:
+            ink = np.minimum(ink, under - T0)
+    # close any hairline gap left where two outlines run side by side
+    ink = closing(g, ink, 0.9)
+    if seed == 0 and roll == 0:
+        pts = [p for loop in contours(g, ink) for p in loop]
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        k = (BOTTOM - TOP) / (max(ys) - min(ys))
+        ox = 50 - 50 * k
+        # keep the cuff on x = 50 unless a thumb would leave the viewBox; then slide the art over
+        ox += max(0.0, MARGIN - (k * min(xs) + ox)) - max(0.0, (k * max(xs) + ox) - (100 - MARGIN))
+        if k * (max(xs) - min(xs)) > 100 - 2 * MARGIN:
+            raise SystemExit('%s is %.1f units wide at full height: too wide for the viewBox' % (name, k * (max(xs) - min(xs))))
+        FIT[name] = (k, ox, TOP - k * min(ys))
+        TIPX[name] = k * xs[ys.index(min(ys))] + ox
+    sdfart.XFORM = FIT[name]
+
+    def jit(v, a):
+        return v + (rng.uniform(-a, a) if seed else 0.0)
+
     svg = SVG(100, 140)
-    pre = name.replace('-', '')
-    # outline: union dilated by OUTLINE
-    svg.path(path_d(g, np.minimum(body, cf), OUTLINE), P['outline'])
-    shade_part(svg, g, body, P, pre + 'B', 'body', rng, seed)
-    at = sampler(g, body)
-    gl = GLINTS[name]
-    # soft glows first, then crisp dots
-    gi = 0
-    for kind, cx, cy, rx, ry, rot in gl:
-        if kind != 'glow':
-            continue
-        if seed:
-            cx += rng.uniform(-0.6, 0.6)
-            cy += rng.uniform(-0.6, 0.6)
-        gid = '%sG%d' % (pre, gi)
-        gi += 1
-        svg.rad(gid, 0.5, 0.5, 0.5, [(0, P['light'], 0.3), (0.5, P['light'], 0.13), (1, P['light'], 0)])
-        if inside_ok(at, cx, cy, rx, ry, rot, 0.5):
-            svg.ellipse(cx, cy, rx, ry, 'url(#%s)' % gid, 1.0, rot)
+    svg.body.append('<!-- tip-x %s cuff-centre-x %s -->' % (sdfart.fmt(TIPX[name]), sdfart.fmt(V.x(50) * FIT[name][0] + FIT[name][1])))
+    svg.path(path_d(g, ink), INK)
+    if under is not None:
+        # things that lie under the hand (a tucked thumb, claws): painted first, then the hand's own line over them
+        svg.path(path_d(g, under), hand.get('under_paint', base_paint))
+        svg.path(path_d(g, whole - weight), INK)
+    svg.path(path_d(g, whole), base_paint)
+
+    # Fingers, stubs and toes, far to near. Turning right brings the left side nearer.
+    order = sorted(parts, key=lambda p: -p.x if V.s >= 0 else p.x)
+    for i, p in enumerate(order):
+        d = np.hypot(g.X - p.root[0], g.Y - p.root[1])
+        fade = np.clip((d - p.r0) / (p.r1 - p.r0), 0, 1) ** 0.7
+        # the part's line stays inside the hand's own outline, and sinks under the paint where it fades
+        ring = inter(p.sdf - ink_weight(g, p.sdf, wobble) * fade + 1.4 * (1 - fade), ink)
+        # Only the band of line that will still show once this part and the nearer ones are
+        # painted is drawn (with a little tucked under the paint). A nearer part can cover most
+        # of a line and leave its faded tail stranded; such a scrap is dropped, not drawn.
+        band = inter(ring, -(p.sdf + 0.9))
+        for q in order[i + 1:]:
+            # ...and where a nearer part's own line runs alongside, only that one is drawn
+            band = inter(band, 2.2 - q.sdf)
+        svg.path(path_d(g, band, min_area=20.0), INK)
+        svg.path(path_d(g, inter(p.sdf, whole)), base_paint)
+
+    lines = None
+    pcx, prx, prz = hand['palm']
+    marks = []
+    for pts in hand.get('darts', []):
+        # A dart is given on the flat drawing: lift it onto the rounded back of the hand, turn it
+        # with the view, and let it bow toward the turn the way a line on a curved surface does.
+        (xa, ya), (xb, yb), (xc, yc) = pts
+        out = []
+        for i in range(7):
+            # resample the dart as one smooth arc, lifted onto the back of the hand and bowed with the turn
+            t = i / 6.0
+            x = (1 - t) ** 2 * xa + 2 * t * (1 - t) * (2 * xb - (xa + xc) / 2) + t * t * xc
+            y = ya + (yc - ya) * t
+            u = max(-0.97, min(0.97, (x - pcx) / prx))
+            out.append((V.x(x, prz * math.sqrt(1 - u * u)) + 1.5 * V.s * math.sin(math.pi * t), y))
+        # A dart keeps clear of the outline. As it nears the edge it shortens, then it is left out.
+        depth = min(-whole[int(round((y - g.y0) / g.h)), int(round((x - g.x0) / g.h))] for x, y in out)
+        keep_len = max(0.0, min(1.0, (depth - 2.6) / 2.6))
+        if keep_len > 0.15:
+            cut = int(round((1 - keep_len) * 2.0))
+            marks.append((out[cut:len(out) - cut], -0.3, DART))
+    for pts, taper, weight_ in marks + cuff_lines():
+        last = (jit(pts[-1][0], 0.4), jit(pts[-1][1], 0.4)) if taper != 0 else pts[-1]
+        pts = [pts[0]] + [(jit(x, 0.3), jit(y, 0.3)) for x, y in pts[1:-1]] + [last]
+        if taper < 0:
+            s = brush(g, pts, jit(weight_, 0.06), -taper, weight_ * 0.62, lead=-taper)
         else:
-            print('  glow outside', name, cx, cy)
-    if name == 'cat-paw':
-        draw_beans(svg, g, P, rng, seed)
-    for kind, cx, cy, rx, ry, rot in gl:
-        if kind != 'dot':
-            continue
-        if seed:
-            cx += rng.uniform(-0.5, 0.5)
-            cy += rng.uniform(-0.5, 0.5)
-            rx *= rng.uniform(0.85, 1.12)
-            ry *= rng.uniform(0.85, 1.12)
-            rot += rng.uniform(-8, 8)
-        if inside_ok(at, cx, cy, rx, ry, rot, 0.6):
-            svg.ellipse(cx, cy, rx, ry, '#FFFFFF', 0.92, rot)
-        else:
-            print('  dot outside', name, cx, cy)
-    # contact occlusion just above the cuff
-    for d, op in ((4.5, 0.12), (2.8, 0.14), (1.4, 0.16)):
-        svg.path(path_d(g, inter(-cf, cf - d, body + 0.2)), P['deep'], op)
-    shade_part(svg, g, cf, P, pre + 'C', 'cuff', rng, seed)
-    atc = sampler(g, cf)
-    gi = 0
-    for kind, cx, cy, rx, ry, rot in CUFF_GLINTS:
-        if seed:
-            cx += rng.uniform(-0.5, 0.5)
-            cy += rng.uniform(-0.4, 0.4)
-            rx *= rng.uniform(0.88, 1.1)
-        if kind == 'glow':
-            gid = '%sCG%d' % (pre, gi)
-            gi += 1
-            svg.rad(gid, 0.5, 0.5, 0.5, [(0, P['light'], 0.6), (1, P['light'], 0)])
-            if inside_ok(atc, cx, cy, rx, ry, rot, 0.4):
-                svg.ellipse(cx, cy, rx, ry, 'url(#%s)' % gid, 1.0, rot)
-        else:
-            if inside_ok(atc, cx, cy, rx, ry, rot, 0.6):
-                svg.ellipse(cx, cy, rx, ry, '#FFFFFF', 0.9, rot)
-            else:
-                print('  cuff dot outside', cx, cy)
-    # hole where the rod goes in
-    svg.rad(pre + 'H', 0.5, 0.35, 0.6, [(0, P['deep'], 0.75), (1, P['deep'], 0)])
-    svg.ellipse(50, 133.6, 9.5, 2.1, 'url(#%sH)' % pre)
+            s = brush(g, pts, jit(weight_, 0.06), taper)
+        lines = s if lines is None else np.minimum(lines, s)
+    # lines run a little way under the outline so there is no seam where they meet it
+    svg.path(path_d(g, inter(lines, whole - 1.0)), INK)
     return svg.text()
 
 
-def draw_beans(svg, g, P, rng, seed):
-    main, beans = paw_beans(g)
-    BP = {'base': '#EE9AA6', 'light': '#FFD3D6', 'shade': '#C96F80', 'deep': '#A95467',
-          'rim': '#F7B8C0', 'outline': '#B85E70'}
-    if seed:
-        main = main + boil_noise(g, seed + 7, 0.35, [])
-    allb = main
-    for b in beans:
-        allb = np.minimum(allb, b)
-    # soft seat shadow under the beans
-    sh = g.shift(allb, -0.75, -1.0)
-    svg.path(path_d(g, sh - 0.4), P['deep'], 0.25)
-    svg.lin('beanG', 0.2, 0.0, 0.7, 1.0, [(0, BP['light'], 1), (0.45, BP['base'], 1), (1, BP['shade'], 1)])
-    svg.path(path_d(g, allb), 'url(#beanG)')
-    nx, ny = g.normals(allb)
-    wdark = np.clip(-(nx * LX + ny * LY), 0, 1) ** 1.2
-    svg.path(path_d(g, band(allb, -0.2, 1.6 * wdark)), BP['deep'], 0.35)
-    for k in range(1, 4):
-        r = 1.0 * k
-        sh = g.shift(allb, -LX * 0.6 * r, -LY * 0.6 * r)
-        svg.path(path_d(g, sh + r), BP['light'], 0.18)
-    dots = [(43.0, 66.6, 3.6, 1.3, -20)] + [(c[0] - 1.7, c[1] - 2.3, 0.95, 1.6, 30) for c, _, _, _ in TOE_BEANS]
-    for cx, cy, rx, ry, rot in dots:
-        if seed:
-            cx += rng.uniform(-0.35, 0.35)
-            cy += rng.uniform(-0.35, 0.35)
-        svg.ellipse(cx, cy, rx, ry, '#FFFFFF', 0.9, rot)
+def roll_suffix(roll):
+    return '' if roll == 0 else '-r%s%d' % ('p' if roll > 0 else 'm', abs(roll))
 
 
 def main():
     outdir = sys.argv[1]
     names = sys.argv[2:] or list(VARIETIES)
     for n in names:
-        for suf, seed in (('', 0), ('-b', 1), ('-c', 2)):
-            txt = build(n, seed)
+        frames = [('', 0, 0), ('-b', 1, 0), ('-c', 2, 0)]
+        frames += [(roll_suffix(r), 0, r) for r in range(-ROLL_MAX, ROLL_MAX + 1) if r]
+        for suf, seed, roll in frames:
+            txt = build(n, seed, roll)
             p = os.path.join(outdir, n + suf + '.svg')
             with open(p, 'w') as f:
                 f.write(txt)

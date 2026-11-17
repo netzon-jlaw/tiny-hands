@@ -16,8 +16,27 @@ struct PointerArt {
     let hasStick: Bool
     /// Wrist point in points (y up) where the stick attaches.
     let wrist: CGPoint
+    /// The hand turned about its long axis: film frames for each roll step from -maxRoll to
+    /// +maxRoll (index = step + maxRoll). Empty when the style has no roll drawings or they
+    /// were not asked for; the middle entry is `frames`.
+    let rolls: [[CGImage]]
+    /// Where the stick attaches at each roll step (the cuff shifts a little as the hand turns).
+    let wrists: [CGPoint]
+    static let maxRoll = 4
 
-    static func make(style: PointerStyle, scale userScale: CGFloat, backing: CGFloat) -> PointerArt {
+    /// Film frames and wrist for a roll step, falling back to the upright hand.
+    func film(roll: Int) -> [CGImage] {
+        let i = roll + Self.maxRoll
+        return rolls.indices.contains(i) ? rolls[i] : frames
+    }
+
+    func wrist(roll: Int) -> CGPoint {
+        let i = roll + Self.maxRoll
+        return wrists.indices.contains(i) ? wrists[i] : wrist
+    }
+
+    /// `rolling` also loads the roll drawings; menus and previews leave it off.
+    static func make(style: PointerStyle, scale userScale: CGFloat, backing: CGFloat, rolling: Bool = false) -> PointerArt {
         let base: CGFloat = 54 * userScale
         let name: String
         let height: CGFloat
@@ -38,8 +57,19 @@ struct PointerArt {
             raws = [style == .catPaw ? renderPaw(height: base * 1.05, backing: backing)
                                      : renderArrow(height: base * 0.62, backing: backing)]
         }
-        let rect = raws.map(alphaRect).reduce(CGRect.null) { $0.union($1) }
-        let cropped = raws.map { rect.isNull ? $0 : ($0.cropping(to: rect) ?? $0) }
+        // Roll drawings (name-rm4 ... name-rp4) share the same viewBox, so the fingertip sits
+        // on the same pixel in every one of them.
+        var rollRaws: [Int: CGImage] = [:]
+        if rolling && style != .classicArrow {
+            for step in -maxRoll...maxRoll where step != 0 {
+                let suffix = "-r" + (step > 0 ? "p" : "m") + String(abs(step))
+                if let img = renderSVG(name + suffix, height: height, backing: backing) { rollRaws[step] = img }
+            }
+            if rollRaws.count != maxRoll * 2 { rollRaws = [:] }
+        }
+        let rect = (raws + Array(rollRaws.values)).map(alphaRect).reduce(CGRect.null) { $0.union($1) }
+        func crop(_ img: CGImage) -> CGImage { rect.isNull ? img : (img.cropping(to: rect) ?? img) }
+        let cropped = raws.map(crop)
         let size = CGSize(width: CGFloat(cropped[0].width) / backing, height: CGFloat(cropped[0].height) / backing)
         let tipPx = findTip(cropped[0], leftmost: style == .classicArrow)
         var hotspot = CGPoint(x: tipPx.x / backing, y: size.height - tipPx.y / backing)
@@ -47,11 +77,23 @@ struct PointerArt {
             // The arrow's rounded outline sits ~7 units above its real corner at (9, 9) in a 92x140 viewBox.
             hotspot = CGPoint(x: size.width * 9 / 92, y: size.height * (1 - 9.0 / 140))
         }
-        let wrist = CGPoint(x: size.width * 0.5, y: 2)
+        // The rod hangs from the middle of the cuff, which is not the middle of the art (thumbs stick out).
+        let wrist = CGPoint(x: cuffCentre(cropped[0]) / backing, y: 2)
         // 6 film frames: boil variant cycles a/b/c, grain re-rolls every frame.
         let frames = (0..<6).map { vintage(cropped[$0 % cropped.count], seed: UInt64($0 + 1), backing: backing) }
+        var rolls: [[CGImage]] = []
+        var wrists: [CGPoint] = []
+        if !rollRaws.isEmpty {
+            for step in -maxRoll...maxRoll {
+                guard step != 0, let raw = rollRaws[step] else { rolls.append(frames); wrists.append(wrist); continue }
+                let img = crop(raw)
+                // Three grain re-rolls of the one drawing keep the film flicker going while it is turned.
+                rolls.append((0..<3).map { vintage(img, seed: UInt64(100 + (step + maxRoll) * 10 + $0), backing: backing) })
+                wrists.append(CGPoint(x: cuffCentre(img) / backing, y: 2))
+            }
+        }
         return PointerArt(image: frames[0], frames: frames, size: size, hotspot: hotspot, tilt: tilt,
-                          hasStick: style != .classicArrow, wrist: wrist)
+                          hasStick: style != .classicArrow, wrist: wrist, rolls: rolls, wrists: wrists)
     }
 
     // MARK: - Vintage film look
@@ -81,11 +123,12 @@ struct PointerArt {
             d[i + 1] = UInt8(max(0, min(255, g)) * af)
             d[i + 2] = UInt8(max(0, min(255, b)) * af)
         }
-        // Dust: a few small dark or light specks on opaque pixels.
-        let specks = Int(CGFloat(w * h) / (900 * backing * backing)) + 2
+        // Dust: a few small specks on opaque pixels. They are faint on purpose: on flat
+        // paint a hard dark dot reads as an eye.
+        let specks = Int(CGFloat(w * h) / (1600 * backing * backing)) + 1
         for _ in 0..<specks {
             let cx = Int(rng.unit() * Float(w)), cy = Int(rng.unit() * Float(h))
-            let radius = backing * CGFloat(0.4 + rng.unit() * 0.8)
+            let radius = backing * CGFloat(0.3 + rng.unit() * 0.5)
             let dark = rng.unit() < 0.65
             let ri = Int(ceil(radius))
             for y in max(0, cy - ri)...min(h - 1, cy + ri) {
@@ -94,8 +137,11 @@ struct PointerArt {
                     guard dx * dx + dy * dy <= radius * radius else { continue }
                     let j = (y * w + x) * 4
                     guard d[j + 3] > 250 else { continue }
-                    let v: UInt8 = dark ? 40 : 250
-                    d[j] = v; d[j + 1] = UInt8(Float(v) * 0.95); d[j + 2] = UInt8(Float(v) * 0.85)
+                    // Darken or lighten what is there instead of stamping a flat dot.
+                    let k: Float = dark ? 0.78 : 1.12
+                    d[j] = UInt8(min(255, Float(d[j]) * k))
+                    d[j + 1] = UInt8(min(255, Float(d[j + 1]) * k))
+                    d[j + 2] = UInt8(min(255, Float(d[j + 2]) * k))
                 }
             }
         }
@@ -239,6 +285,16 @@ struct PointerArt {
         }
         guard maxX >= minX, maxY >= minY else { return .null }
         return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+    }
+
+    /// Middle of the cuff's bottom edge, in pixels from the left: the centre of the opaque run in the lowest rows.
+    private static func cuffCentre(_ img: CGImage) -> CGFloat {
+        let (d, w, h) = pixels(img)
+        var lo = w, hi = -1
+        for y in max(0, h - max(2, h / 40))..<h {
+            for x in 0..<w where d[(y * w + x) * 4 + 3] > 120 { lo = min(lo, x); hi = max(hi, x) }
+        }
+        return hi >= lo ? CGFloat(lo + hi + 1) / 2 : CGFloat(w) / 2
     }
 
     /// Tip in pixels from the top-left: the topmost opaque row (averaged), or

@@ -1,17 +1,26 @@
-import AppKit
-import ApplicationServices
+@preconcurrency import AppKit
+@preconcurrency import ApplicationServices
+import os
 
 /// Watches mouse clicks system-wide. With Accessibility permission it uses an
 /// active CGEventTap, which also lets Presentation Mode swallow clicks.
 /// Without permission it falls back to a passive NSEvent global monitor.
+///
+/// The tap runs on its own thread and its callback only reads a flag and hands the
+/// click to the main thread asynchronously. Every mouse event in the system waits
+/// for this callback, so it must never wait on the main thread (animations, timers).
 @MainActor
 final class ClickMonitor {
     var onMouseDown: (() -> Void)?
     /// When true, mouse button events never reach the apps underneath.
-    var swallowClicks = false
+    var swallowClicks: Bool {
+        get { swallow.withLock { $0 } }
+        set { swallow.withLock { $0 = newValue } }
+    }
 
-    private var tap: CFMachPort?
-    private var source: CFRunLoopSource?
+    fileprivate nonisolated let swallow = OSAllocatedUnfairLock(initialState: false)
+    fileprivate nonisolated(unsafe) var tap: CFMachPort?
+    private var tapThread: Thread?
     private var globalMonitor: Any?
     private var localMonitor: Any?
     private var permissionPoll: Timer?
@@ -52,9 +61,16 @@ final class ClickMonitor {
                                           options: .defaultTap, eventsOfInterest: mask,
                                           callback: clickTapCallback, userInfo: refcon) else { return false }
         self.tap = tap
-        source = CFMachPortCreateRunLoopSource(nil, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
-        CGEvent.tapEnable(tap: tap, enable: true)
+        let source = CFMachPortCreateRunLoopSource(nil, tap, 0)
+        let thread = Thread {
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+            CFRunLoopRun()
+        }
+        thread.name = "TinyHands.ClickTap"
+        thread.qualityOfService = .userInteractive
+        thread.start()
+        tapThread = thread
         return true
     }
 
@@ -76,16 +92,19 @@ final class ClickMonitor {
         localMonitor = nil
     }
 
-    fileprivate func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+    /// Runs on the tap thread. Must return immediately.
+    fileprivate nonisolated func handle(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
         switch type {
         case .tapDisabledByTimeout, .tapDisabledByUserInput:
             if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
             return Unmanaged.passUnretained(event)
         case .leftMouseDown, .rightMouseDown, .otherMouseDown:
-            onMouseDown?()
-            return swallowClicks ? nil : Unmanaged.passUnretained(event)
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated { self?.onMouseDown?() }
+            }
+            return swallow.withLock { $0 } ? nil : Unmanaged.passUnretained(event)
         default:
-            return swallowClicks ? nil : Unmanaged.passUnretained(event)
+            return swallow.withLock { $0 } ? nil : Unmanaged.passUnretained(event)
         }
     }
 }
@@ -94,5 +113,5 @@ private func clickTapCallback(proxy: CGEventTapProxy, type: CGEventType, event: 
                               refcon: UnsafeMutableRawPointer?) -> Unmanaged<CGEvent>? {
     guard let refcon else { return Unmanaged.passUnretained(event) }
     let monitor = Unmanaged<ClickMonitor>.fromOpaque(refcon).takeUnretainedValue()
-    return MainActor.assumeIsolated { monitor.handle(type: type, event: event) }
+    return monitor.handle(type: type, event: event)
 }

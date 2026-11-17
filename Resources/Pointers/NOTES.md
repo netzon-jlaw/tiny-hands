@@ -262,3 +262,12 @@ TikTok posts) and middle finger (from a listing). No public page that could be r
 without logging in showed thumbs-up, rock-on, high-five or cat-paw versions of this toy.
 They are kept as in-family designs for the app, with colours taken from the confirmed
 product colours: green, yellow, purple, pink and blue.
+
+## Archived styles and stick options
+
+- Middle Child, Peace Sign, Thumbs Up and Rock On (all their boil and roll frames) are in
+  `archive/`, which the build does not bundle. See `archive/README.md` to restore one.
+- The stick is drawn in code by default (**Solid**: flat paint, a cel shade band on the
+  right, a broken white shine and the hands' ink outline). **Expandable** uses `stick.svg`.
+  Both take the user's stick colour (white by default); on the expandable rod a non-white
+  colour tints the mid-tones and keeps the highlights white.

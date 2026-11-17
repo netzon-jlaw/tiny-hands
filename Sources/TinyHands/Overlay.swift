@@ -44,6 +44,11 @@ struct Ink {
     /// #D2B98C
     static let sepia = CGColor(srgbRed: 0xD2 / 255.0, green: 0xB9 / 255.0, blue: 0x8C / 255.0, alpha: 1)
 
+    /// Pale-yellow accent paint, #F6D27A.
+    static let yellow = CGColor(srgbRed: 0xF6 / 255.0, green: 0xD2 / 255.0, blue: 0x7A / 255.0, alpha: 1)
+    /// Faded-red accent paint, #C2493B.
+    static let red = CGColor(srgbRed: 0xC2 / 255.0, green: 0x49 / 255.0, blue: 0x3B / 255.0, alpha: 1)
+
     /// Line work (rings, plinks, shake lines, streaks): ink, or cream on a dark screen.
     var marks: CGColor { dark ? Ink.cream : Ink.ink }
     /// Outline under painted shapes.
@@ -76,8 +81,16 @@ final class PointerLayers {
     /// The drawn rod (Resources/Pointers/stick.svg), when bundled.
     let rodArt = CALayer()
     private let rodFade = CAGradientLayer()
+    /// The solid rod: flat paint, a cel shade down one side, a shine stripe and an ink outline.
+    let rodSolid = CALayer()
+    private let solidFill = CAShapeLayer()
+    private let solidShade = CAShapeLayer()
+    private let solidShine = CAShapeLayer()
+    private let solidOutline = CAShapeLayer()
+    private let solidFade = CAGradientLayer()
     var art: PointerArt?
     var ink = Ink(dark: false)
+    private var stickColor = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
     private var frameIndex = 0
     /// Which roll drawing is showing (0 = upright).
     private var rollStep = 0
@@ -123,7 +136,11 @@ final class PointerLayers {
         hand.shadowOpacity = 0
         stick.addSublayer(rod)
         stick.addSublayer(rodArt)
+        stick.addSublayer(rodSolid)
         rodArt.isHidden = true
+        rodSolid.isHidden = true
+        [solidFill, solidShade, solidShine, solidOutline].forEach(rodSolid.addSublayer)
+        rodSolid.mask = solidFade
     }
 
     private static let stickSVG: NSImage? = {
@@ -146,7 +163,47 @@ final class PointerLayers {
         return ctx.makeImage()
     }
 
-    func apply(_ art: PointerArt, contentsScale: CGFloat, ink: Ink) {
+    /// Recolours the grey metal rod: the colour fills the mid-tones and the specular
+    /// highlights stay white. White leaves the rod as drawn.
+    private static func tint(_ img: CGImage, _ color: CGColor) -> CGImage {
+        let c = color.converted(to: CGColorSpace(name: CGColorSpace.sRGB)!, intent: .defaultIntent, options: nil)?.components ?? [1, 1, 1, 1]
+        let tr = Float(c[0]), tg = Float(c.count > 2 ? c[1] : c[0]), tb = Float(c.count > 2 ? c[2] : c[0])
+        if tr > 0.99 && tg > 0.99 && tb > 0.99 { return img }
+        let w = img.width, h = img.height
+        var d = [UInt8](repeating: 0, count: w * h * 4)
+        let ctx = CGContext(data: &d, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        ctx.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+        for i in stride(from: 0, to: d.count, by: 4) {
+            let a = Float(d[i + 3]) / 255
+            guard a > 0 else { continue }
+            let l = (0.299 * Float(d[i]) + 0.587 * Float(d[i + 1]) + 0.114 * Float(d[i + 2])) / 255 / a
+            let hi = pow(min(1, l), 4)
+            func mix(_ t: Float) -> UInt8 { UInt8(max(0, min(1, t * min(1, l * 1.25) * (1 - hi) + hi)) * a * 255) }
+            d[i] = mix(tr); d[i + 1] = mix(tg); d[i + 2] = mix(tb)
+        }
+        return ctx.makeImage() ?? img
+    }
+
+    /// A slightly darker, warmer cel shade of `color` (sepia-leaning, never grey).
+    static func shade(of color: CGColor, by k: CGFloat = 1) -> CGColor {
+        let (r, g, b) = rgb(color)
+        // Multiply by the sepia shade used on the painted tap effects.
+        return CGColor(srgbRed: r * 0.82 * k, green: g * 0.73 * k, blue: b * 0.6 * k, alpha: 1)
+    }
+
+    static func rgb(_ color: CGColor) -> (CGFloat, CGFloat, CGFloat) {
+        let c = color.converted(to: CGColorSpace(name: CGColorSpace.sRGB)!, intent: .defaultIntent, options: nil)?.components ?? [1, 1, 1, 1]
+        return c.count > 2 ? (c[0], c[1], c[2]) : (c[0], c[0], c[0])
+    }
+
+    static func luminance(_ color: CGColor) -> CGFloat {
+        let (r, g, b) = rgb(color)
+        return 0.299 * r + 0.587 * g + 0.114 * b
+    }
+
+    func apply(_ art: PointerArt, contentsScale: CGFloat, ink: Ink, stickStyle: StickStyle, stickColor: CGColor) {
         self.art = art
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -168,10 +225,60 @@ final class PointerLayers {
         let len = art.size.height * 5.6
         stick.isHidden = !art.hasStick
         stick.frame = CGRect(x: art.wrist.x, y: art.wrist.y, width: 0, height: 0)
+        rodSolid.isHidden = true
+
+        if art.hasStick && stickStyle == .solid {
+            // A plain painted dowel, thinner than the metal rod, in flat cel paint.
+            let w = max(5, art.size.height * 0.2)
+            let ow = max(1.2, w * 0.12)
+            let top = w * 0.6           // tucks a little way up under the cuff
+            let rect = CGRect(x: -w / 2, y: top - len, width: w, height: len)
+            rod.isHidden = true
+            rodArt.isHidden = true
+            rodSolid.isHidden = false
+            rodSolid.frame = CGRect(x: 0, y: 0, width: 0, height: 0)
+            let body = CGPath(roundedRect: rect, cornerWidth: w / 2, cornerHeight: w / 2, transform: nil)
+            solidOutline.path = body
+            solidOutline.fillColor = nil
+            // The same even ink line as the hands; a near-black stick on a dark desktop
+            // gets a cream outline so it still shows.
+            // (Set in setInk, which also runs when the appearance changes.)
+            self.stickColor = stickColor
+            solidOutline.lineWidth = ow
+            solidFill.path = body
+            solidFill.fillColor = stickColor
+            // Cel shade: a band down the right (shadow) side, inside the outline.
+            let shadeRect = CGRect(x: w * 0.18, y: rect.minY, width: w * 0.26, height: len - w * 0.2)
+            solidShade.path = CGPath(roundedRect: shadeRect, cornerWidth: w * 0.13, cornerHeight: w * 0.13, transform: nil)
+            solidShade.fillColor = Self.shade(of: stickColor)
+            // Shine: a short white stroke near the lit (left) edge, broken like a cel highlight.
+            let shine = CGMutablePath()
+            let sx = -w * 0.2
+            shine.move(to: CGPoint(x: sx, y: top - w * 1.1))
+            shine.addLine(to: CGPoint(x: sx, y: top - len * 0.34))
+            shine.move(to: CGPoint(x: sx, y: top - len * 0.34 - w * 0.9))
+            shine.addLine(to: CGPoint(x: sx, y: top - len * 0.34 - w * 1.6))
+            solidShine.path = shine
+            solidShine.strokeColor = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 0.85)
+            solidShine.fillColor = nil
+            solidShine.lineWidth = max(1, w * 0.16)
+            solidShine.lineCap = .round
+            [solidFill, solidShade, solidShine, solidOutline].forEach { $0.contentsScale = contentsScale }
+            // Fade the far end so the rod never stops dead in the middle of the screen.
+            solidFade.frame = CGRect(x: rect.minX - ow, y: rect.minY, width: rect.width + ow * 2, height: rect.height + ow)
+            solidFade.startPoint = CGPoint(x: 0.5, y: 1)
+            solidFade.endPoint = CGPoint(x: 0.5, y: 0)
+            solidFade.colors = [CGColor.black, CGColor.black, CGColor.clear]
+            solidFade.locations = [0, 0.72, 1]
+            CATransaction.commit()
+            setInk(ink)
+            return
+        }
 
         if art.hasStick, let svg = Self.stickSVG {
             let w = len * svg.size.width / svg.size.height
-            if let img = Self.renderStick(svg, size: CGSize(width: w, height: len), backing: contentsScale) {
+            if let raw = Self.renderStick(svg, size: CGSize(width: w, height: len), backing: contentsScale) {
+                let img = Self.tint(raw, stickColor)
                 rod.isHidden = true
                 rodArt.isHidden = false
                 rodArt.anchorPoint = CGPoint(x: 0.5, y: 1)
@@ -210,6 +317,7 @@ final class PointerLayers {
         self.ink = ink
         CATransaction.begin()
         CATransaction.setDisableActions(true)
+        solidOutline.strokeColor = Self.luminance(stickColor) < 0.25 && ink.dark ? Ink.cream : Ink.ink
         let c = ink.stick
         // Gradient runs from the wrist (top, y = 1) to the far end (bottom, y = 0).
         rod.startPoint = CGPoint(x: 0.5, y: 1)
@@ -259,32 +367,40 @@ struct TapBounce {
     let down: CFTimeInterval
 }
 
-/// What a tap leaves on the glass, drawn as 1930s cel effects on twos.
+/// What a tap leaves on the glass, drawn as rubber-hose cel effects on twos.
 struct TapMark {
     /// Outer reach of the effect (pt, at pointer size 1).
     var radius: CGFloat
     /// Number of cel drawings, each held for 1/12 s.
     var drawings: Int
-    /// Weight of the squash-and-stretch impact ring (0 = none).
-    var ring: CGFloat = 1
-    /// A second, wider ring a drawing later.
-    var echo = false
-    /// The ring breaks into brush segments on its last drawing.
-    var breakRing = false
-    /// Short "plink" flecks of line flying off the contact.
-    var plinks = 0
-    /// Ink-outlined dust puffs.
+    /// Emanata: tapered dashes radiating from the hit.
+    var dashes = 4
+    /// Dash rings (2 = a second, wider ring a drawing later).
+    var dashRings = 1
+    /// Points on the pow starburst behind the hit (0 = none).
+    var pow = 0
+    /// Pow paint: 0 cream, 1 pale yellow, 2 faded red with a yellow core.
+    var powTone = 0
+    /// One drawing of inverse paint (solid ink star, cream rim) as the hit lands.
+    var flash = false
+    /// Little 5-point stars flung up and out.
+    var stars = 0
+    /// Teardrop plewds flung off the hit.
+    var drops = 0
+    /// Scalloped dust puffs.
     var puffs = 0
     /// Four-point sparkle crosses.
     var sparkles = 0
-    /// Little five-point stars thrown up and out.
-    var stars = 0
-    /// Vibration lines either side of the hand.
-    var shakes = false
+    /// Dizzy stars orbiting the hit.
+    var squeans = 0
+    /// Spiral dizzy curls.
+    var curls = 0
+    /// Zigzag vibration lines either side of the hand.
+    var agitrons = false
     /// Speed lines along the slam, on the impact drawing.
     var streaks = 0
-    /// Tiny ink droplets.
-    var flecks = 0
+    /// Effect jitter in points on its first drawings (0 = still).
+    var shake: CGFloat = 0
 }
 
 struct TapRecipe {
@@ -317,32 +433,31 @@ struct TapRecipe {
             // A polite single peck: a small lift, straight back down, nothing else.
             return TapRecipe(lift: 0.3, swing: 2, grow: 1.04, windUp: 0.040, hang: 0, slam: 0.026,
                              squash: 0.97, bounces: [], wobble: 0,
-                             mark: TapMark(radius: 24, drawings: 3, ring: 0.7, plinks: 3))
+                             mark: TapMark(radius: 28, drawings: 3, dashes: 5))
         case 2:
             return TapRecipe(lift: 0.55, swing: 4, grow: 1.08, windUp: 0.044, hang: 0, slam: 0.028,
                              squash: 0.95, bounces: [chatter], wobble: 0,
-                             mark: TapMark(radius: 32, drawings: 4, ring: 0.85, plinks: 5, puffs: 1, sparkles: 1))
+                             mark: TapMark(radius: 32, drawings: 3, dashes: 6, puffs: 1))
         case 3:
             return TapRecipe(lift: 0.9, swing: 6, grow: 1.13, windUp: 0.048, hang: 0, slam: 0.030,
                              squash: 0.92, bounces: [chatter, TapBounce(height: 0.16, up: 0.05, down: 0.035)],
                              wobble: 0,
-                             mark: TapMark(radius: 42, drawings: 5, ring: 1, plinks: 6, puffs: 2, sparkles: 2,
-                                           streaks: 2))
+                             mark: TapMark(radius: 42, drawings: 5, dashes: 8, pow: 6, stars: 2, streaks: 2))
         case 4:
             return TapRecipe(lift: 1.4, swing: 9, grow: 1.22, windUp: 0.052, hang: 0.006, slam: 0.030,
                              squash: 0.89, bounces: [chatter, TapBounce(height: 0.3, up: 0.06, down: 0.04)],
                              wobble: 2.5,
-                             mark: TapMark(radius: 52, drawings: 6, ring: 1.15, breakRing: true, plinks: 7,
-                                           puffs: 3, sparkles: 2, shakes: true, streaks: 3))
+                             mark: TapMark(radius: 52, drawings: 7, dashes: 8, pow: 8, powTone: 1, flash: true, stars: 3,
+                                           drops: 2, puffs: 2, agitrons: true, streaks: 3))
         default:
             return TapRecipe(lift: 2.1, swing: 13, grow: 1.32, windUp: 0.056, hang: 0.006, slam: 0.032,
                              squash: 0.85,
                              bounces: [chatter, TapBounce(height: 0.42, up: 0.065, down: 0.042),
                                        TapBounce(height: 0.12, up: 0.04, down: 0.03)],
                              wobble: 4,
-                             mark: TapMark(radius: 62, drawings: 7, ring: 1.3, echo: true, breakRing: true,
-                                           plinks: 8, puffs: 5, sparkles: 2, stars: 3, shakes: true,
-                                           streaks: 3, flecks: 6))
+                             mark: TapMark(radius: 62, drawings: 8, dashes: 12, pow: 8, powTone: 2, flash: true,
+                                           stars: 4, drops: 2, puffs: 2, squeans: 3, curls: 2,
+                                           agitrons: true, streaks: 3, shake: 2))
         }
     }
 }
@@ -358,21 +473,38 @@ struct TapGeometry {
 }
 
 /// One tap effect as cel drawings: one path per drawing for each paint layer.
+/// Layers stack bottom to top: outline, red, yellow, paint, rim, flash, lines, strokes.
 struct TapCels {
-    /// Impact rings (even-odd fill, line ink).
-    var ring: [CGPath] = []
-    /// Plinks, shake lines, streaks, flecks (line ink).
-    var lines: [CGPath] = []
     /// Ink under the painted shapes; stroked at 2x outlineWidth so it shows as an outline.
     var outline: [CGPath] = []
-    /// Sepia shade of the painted shapes.
-    var shade: [CGPath] = []
-    /// Cream paint, offset up-left so a sepia crescent shows bottom-right.
+    /// Faded-red accent paint (the outer pow star on the wildest taps).
+    var red: [CGPath] = []
+    /// Pale-yellow accent paint (pow stars on hard taps, the odd flung star).
+    var yellow: [CGPath] = []
+    /// Cream cel paint: puffs, stars, drops, sparkles.
     var paint: [CGPath] = []
+    /// Cream rim around the inverse hit-flash star (stroked at 2x outlineWidth).
+    var rim: [CGPath] = []
+    /// The one-drawing inverse hit flash: a solid ink star.
+    var flash: [CGPath] = []
+    /// Filled line work: emanata dashes, speed lines (line ink).
+    var lines: [CGPath] = []
+    /// Stroked line work: agitron zigzags and dizzy spirals (line ink, round caps).
+    var strokes: [CGPath] = []
     var outlineWidth: CGFloat = 1.5
-    var drawings: Int { ring.count }
+    var strokeWidth: CGFloat = 1.5
+    /// Jitter of the whole effect, in points, on the first few drawings (0 = still).
+    var shake: CGFloat = 0
+    var drawings: Int { lines.count }
 }
 
+/// Rubber-hose (1920s-30s cartoon) impact flourishes, drawn as flat cel art: thick uniform
+/// ink outlines with round joins, flat cream paint with at most a yellow or red accent,
+/// bulbous shapes with teardrop ends, everything placed radially around the hit, and every
+/// drawing re-jittered so the lines boil. Vocabulary from Mort Walker's comics symbols:
+/// emanata (radiating dashes), a pow starburst, 5-point stars, plewds (teardrops),
+/// briffits (dust puffs), agitrons (vibration zigzags), squeans (orbiting dizzy stars)
+/// and spiral curls.
 enum TapFX {
     static func at(_ ang: CGFloat, _ r: CGFloat, _ c: CGPoint = .zero) -> CGPoint {
         CGPoint(x: c.x + cos(ang) * r, y: c.y + sin(ang) * r)
@@ -387,120 +519,204 @@ enum TapFX {
         }
     }
 
+    /// `count` angles evenly round the full circle, jittered ±12°, with one gap left out
+    /// (when there are six or more) so the ring never looks mechanical.
+    static func ring(_ count: Int, offset: CGFloat) -> [CGFloat] {
+        guard count > 0 else { return [] }
+        let slots = count >= 6 ? count + 1 : count
+        let skip = count >= 6 ? Int.random(in: 0..<slots) : -1
+        let j: CGFloat = 12 * .pi / 180
+        let step = 2 * CGFloat.pi / CGFloat(slots)
+        return (0..<slots).filter { $0 != skip }.map { (i: Int) -> CGFloat in
+            let base: CGFloat = offset + CGFloat(i) * step
+            return base + CGFloat.random(in: -j...j)
+        }
+    }
+
     static func make(_ m: TapMark, radius R: CGFloat, geometry g: TapGeometry) -> TapCels {
         let n = max(1, m.drawings)
-        let ring = (0..<n).map { _ in CGMutablePath() }
-        let lines = (0..<n).map { _ in CGMutablePath() }
-        let outline = (0..<n).map { _ in CGMutablePath() }
-        let shade = (0..<n).map { _ in CGMutablePath() }
-        let paint = (0..<n).map { _ in CGMutablePath() }
-        let ow = max(1.2, R * 0.04)
+        func blank() -> [CGMutablePath] { (0..<n).map { _ in CGMutablePath() } }
+        let outline = blank(), red = blank(), yellow = blank(), paint = blank()
+        let rim = blank(), flash = blank(), lines = blank(), strokes = blank()
+        // Ink about 9% of a painted shape's size, never thinner than 1.4 pt.
+        let ow = max(1.4, R * 0.045)
         // The open side: straight away from the hand, which covers the other side.
         let away = atan2(-g.handCenter.y, -g.handCenter.x)
 
-        // Impact ring: squashes and stretches as it spreads and thins.
-        if m.ring > 0 {
-            let life = min(n, 4)
+        /// A painted shape: ink outline under flat paint.
+        func painted(_ p: CGPath, _ k: Int, into fill: [CGMutablePath]) {
+            outline[k].addPath(p)
+            fill[k].addPath(p)
+        }
+
+        // Pow starburst behind the hit: snaps in big, settles, holds while boiling, pops.
+        let powR = R * (m.powTone == 2 ? 0.48 : 0.4)
+        if m.pow > 0 {
+            let life = min(n, 6)
+            let rays = (0..<m.pow).map { _ in CGFloat.random(in: 0.72...1.0) }
+            let rot = CGFloat.random(in: 0...(2 * .pi))
             for k in 0..<life {
-                addRing(ring[k], k: k, life: life, R: R, weight: m.ring, broken: m.breakRing && k == life - 1)
-            }
-            if m.echo && n > 1 {
-                let life2 = min(n - 1, 3)
-                for k in 0..<life2 {
-                    addRing(ring[k + 1], k: k, life: life2, R: R * 1.25, weight: m.ring * 0.55,
-                            broken: k == life2 - 1)
+                let scale: CGFloat = k == 0 ? 1.25 : k == 1 ? 0.95 : (k == life - 1 && life > 3 ? 1.12 : 1.0)
+                let r = powR * scale
+                let step: CGFloat = k == life - 1 && life > 3 ? 0.08 : 0
+                let outer = starPath(points: m.pow, radius: r, rays: rays, inner: 0.52, rotation: rot + step)
+                if k == 0 && m.flash {
+                    // One drawing of inverse paint: solid ink star with a cream rim.
+                    rim[k].addPath(outer)
+                    flash[k].addPath(outer)
+                    continue
+                }
+                switch m.powTone {
+                case 2:
+                    painted(outer, k, into: red)
+                    let inner = starPath(points: m.pow, radius: r * 0.6, rays: rays, inner: 0.55, rotation: rot + step)
+                    yellow[k].addPath(inner)
+                case 1: painted(outer, k, into: yellow)
+                default: painted(outer, k, into: paint)
                 }
             }
         }
 
-        // Plinks: thin brush flecks flying off the hit, in the first three drawings.
-        let plinkAngles = fan(m.plinks, mid: away, span: min(4.6, 0.95 * CGFloat(m.plinks)), jitter: 0.12)
-        let plinkLen = plinkAngles.map { _ in CGFloat.random(in: 0.75...1.15) }
-        for k in 0..<min(3, n) {
-            let kk = CGFloat(k)
-            for (i, a0) in plinkAngles.enumerated() {
-                let a = a0 + .random(in: -0.04...0.04)
-                let r0 = R * (0.40 + 0.24 * kk) * .random(in: 0.95...1.05)
-                let len = R * (0.30 - 0.07 * kk) * plinkLen[i]
-                addSpike(lines[k], from: at(a, r0), to: at(a, r0 + len), width: R * 0.07 * (1 - 0.28 * kk))
+        // Emanata: short tapered dashes radiating from the hit, fat end in, on the first
+        // three drawings (burst out, full length, thinning as they fly off).
+        let push: CGFloat = m.pow > 0 ? 1.18 : 1
+        let dashW = max(2.4, R * 0.09)
+        for ringIndex in 0..<m.dashRings {
+            let angles = ring(m.dashes / m.dashRings, offset: .random(in: 0...(2 * .pi)))
+            let lens = angles.map { _ in CGFloat.random(in: 0.8...1.15) }
+            let start = ringIndex            // the outer ring starts a drawing later
+            let far: CGFloat = ringIndex == 0 ? 1 : 1.3
+            let stages: [(CGFloat, CGFloat, CGFloat)] = [(0.55, 0.80, 1.0), (0.62, 1.02, 0.9), (0.88, 1.1, 0.55)]
+            for (s, stage) in stages.enumerated() where start + s < n {
+                for (i, a0) in angles.enumerated() {
+                    let a = a0 + .random(in: -0.03...0.03)
+                    let r0 = R * stage.0 * push * far
+                    let r1 = r0 + (R * stage.1 * push * far - r0) * lens[i]
+                    addWedge(lines[start + s], from: at(a, r0), to: at(a, r1), width: dashW * stage.2 * (ringIndex == 0 ? 1 : 0.8))
+                }
             }
         }
 
-        // Dust puffs: pop out of the hit, billow, drift outward and break up.
-        let puffAngles = fan(m.puffs, mid: away + .random(in: -0.3...0.3),
-                             span: min(3.8, 1.0 * CGFloat(m.puffs)), jitter: 0.22)
+        // Little 5-point stars flung up and out, turning 15° a drawing.
+        let starAngles = fan(m.stars, mid: away + .random(in: -0.2...0.2), span: min(2.4, 0.8 * CGFloat(m.stars)), jitter: 0.2)
+        for (si, a) in starAngles.enumerated() {
+            let spin: CGFloat = (Bool.random() ? 1 : -1) * 15 * .pi / 180
+            let size = R * 0.12 * .random(in: 0.85...1.15)
+            let accent = m.powTone > 0 && si % 2 == 1
+            for k in 0..<n {
+                let p = n > 1 ? CGFloat(k) / CGFloat(n - 1) : 0
+                let e = 1 - (1 - p) * (1 - p)
+                let c = at(a, R * (0.45 + 0.7 * e), CGPoint(x: 0, y: R * 0.3 * sin(.pi * p)))
+                let s = size * (k == 0 ? 1.25 : k == n - 1 ? 0.6 : 1)
+                let star = starPath(points: 5, radius: s, rays: [1, 1, 1, 1, 1], inner: 0.48,
+                                    rotation: spin * CGFloat(k), center: c)
+                painted(star, k, into: accent ? yellow : paint)
+            }
+        }
+
+        // Plewds: teardrops flung off the hit, round end leading, falling as they go.
+        let dropAngles = fan(m.drops, mid: away + .random(in: -0.4...0.4), span: min(2.2, 0.9 * CGFloat(m.drops)), jitter: 0.25)
+        for a in dropAngles {
+            let size = R * 0.065 * .random(in: 0.85...1.15)
+            let life = min(n, 5)
+            for k in 0..<life {
+                let p = life > 1 ? CGFloat(k) / CGFloat(life - 1) : 0
+                let e = 1 - (1 - p) * (1 - p)
+                let c = at(a, R * (0.5 + 0.6 * e), CGPoint(x: 0, y: -R * 0.3 * p * p))
+                // Direction of travel, bending down with gravity.
+                let dir = atan2(sin(a) - 0.9 * p, cos(a))
+                let drop = CGMutablePath()
+                addTeardrop(drop, center: c, radius: size * (k == 0 ? 0.8 : 1), direction: dir,
+                            tail: k == 0 ? 3.4 : 2.4)
+                painted(drop, k, into: paint)
+            }
+        }
+
+        // Briffits: scalloped dust puffs that pop out on the diagonals, billow and break up.
+        let puffAngles = fan(m.puffs, mid: away + .random(in: -0.3...0.3), span: min(3.2, 1.2 * CGFloat(m.puffs)), jitter: 0.2)
         for a in puffAngles {
-            let size = R * 0.15 * .random(in: 0.85...1.15)
-            let lobes: [(CGFloat, CGFloat, CGFloat)] = [(0, 0, 1)] + (0..<4).map { i in
-                (CGFloat(i) * .pi / 2 + .random(in: -0.4...0.4), .random(in: 0.55...0.7), .random(in: 0.6...0.78))
-            }
+            let size = R * (m.pow > 0 ? 0.13 : 0.2) * .random(in: 0.85...1.15)
+            let scallops = Int.random(in: 5...7)
+            let phase = CGFloat.random(in: 0...(2 * .pi))
             for k in 0..<n {
                 let p = n > 1 ? CGFloat(k) / CGFloat(n - 1) : 0
-                let dist = R * (0.34 + 0.5 * (1 - (1 - p) * (1 - p)))
-                let c = at(a, dist, CGPoint(x: 0, y: R * 0.08 * p))
-                let sc = pow(sin(.pi * (0.14 + 0.78 * p)), 0.6)
-                let breakup = max(0, p - 0.62) * 1.6
-                var circles: [(CGPoint, CGFloat)] = []
-                for (li, lobe) in lobes.enumerated() {
-                    if li == 0 && breakup > 0.3 { continue }
-                    let off = size * sc * lobe.1 * (1 + breakup)
-                    let r = size * sc * lobe.2 * .random(in: 0.93...1.07) * (1 - breakup * 0.3)
-                    circles.append((at(lobe.0, off, c), max(0.5, r)))
+                let dist = R * (m.pow > 0 ? 0.5 + 0.4 * (1 - (1 - p) * (1 - p)) : 0.4 + 0.25 * p)
+                let c = at(a, dist, CGPoint(x: 0, y: R * 0.1 * p))
+                let sc: CGFloat = k == 0 ? 0.6 : (p > 0.85 ? 0.9 : 1.0)
+                let cloud = CGMutablePath()
+                // Centre blob plus a ring of lobes; the lobes drift apart on the last drawings.
+                let spread: CGFloat = p > 0.85 ? 1.35 : 1
+                if p <= 0.85 { cloud.addEllipse(in: circle(c, size * sc * 0.75)) }
+                for i in 0..<scallops {
+                    let la = phase + CGFloat(i) / CGFloat(scallops) * 2 * .pi + .random(in: -0.15...0.15)
+                    let lr = size * sc * .random(in: 0.42...0.52) * (p > 0.85 ? 0.7 : 1)
+                    cloud.addEllipse(in: circle(at(la, size * sc * 0.62 * spread, c), lr))
                 }
-                addPainted(circles: circles, ow: ow, k: k, outline: outline, shade: shade, paint: paint)
+                painted(cloud, k, into: paint)
             }
         }
 
-        // Sparkle crosses: twinkle once near the edge of the hit.
-        let sparkAngles = fan(m.sparkles, mid: away + .random(in: -0.5...0.5),
-                              span: min(2.6, 1.3 * CGFloat(m.sparkles)), jitter: 0.25)
+        // Sparkle crosses: twinkle once near the rim.
+        let sparkAngles = fan(m.sparkles, mid: away + .random(in: -0.6...0.6), span: min(2.6, 1.4 * CGFloat(m.sparkles)), jitter: 0.25)
         for (i, a) in sparkAngles.enumerated() {
-            let start = i % 2
-            let dist = R * .random(in: 0.78...0.98)
-            let sizes: [CGFloat] = [0.55, 1.0, 0.7, 0.35]
-            let rot0 = CGFloat.random(in: -0.3...0.3)
+            let start = 1 + i % 2
+            let dist = R * .random(in: 0.8...1.0)
+            let sizes: [CGFloat] = [0.6, 1.0, 0.45]
             for j in 0..<sizes.count where start + j < n {
-                let path = CGMutablePath()
-                addSparkle(path, center: at(a, dist * (1 + 0.05 * CGFloat(j))), radius: R * 0.16 * sizes[j],
-                           rotation: rot0 + 0.2 * CGFloat(j))
-                outline[start + j].addPath(path, transform: CGAffineTransform(translationX: ow * 0.3, y: -ow * 0.3))
-                paint[start + j].addPath(path)
+                let sp = CGMutablePath()
+                addSparkle(sp, center: at(a, dist), radius: R * 0.15 * sizes[j], rotation: 0.15 * CGFloat(j))
+                painted(sp, start + j, into: paint)
             }
         }
 
-        // Little stars thrown up and out in an arc, tumbling.
-        let starAngles = fan(m.stars, mid: away + .random(in: -0.2...0.2), span: 2.0, jitter: 0.2)
-        for a in starAngles {
-            let spin = CGFloat.random(in: 0.35...0.6) * (Bool.random() ? 1 : -1)
-            let size = R * 0.11 * .random(in: 0.85...1.15)
-            for k in 0..<n {
-                let p = n > 1 ? CGFloat(k) / CGFloat(n - 1) : 0
-                let c = at(a, R * (0.35 + 0.8 * p), CGPoint(x: 0, y: R * 0.35 * sin(.pi * p)))
-                let s = size * (k == 0 ? 0.6 : 1 - 0.35 * p)
-                let star = CGMutablePath()
-                addStar(star, center: c, radius: s, inner: 0.46, points: 5, rotation: spin * CGFloat(k))
-                let lit = CGMutablePath()
-                addStar(lit, center: CGPoint(x: c.x - s * 0.1, y: c.y + s * 0.1), radius: s * 0.8, inner: 0.46,
-                        points: 5, rotation: spin * CGFloat(k))
-                outline[k].addPath(star, transform: CGAffineTransform(translationX: ow * 0.3, y: -ow * 0.3))
-                shade[k].addPath(star)
-                paint[k].addPath(lit)
+        // Squeans: little stars orbiting the hit on a flattened ellipse, one turn over the effect.
+        if m.squeans > 0 {
+            let centre = at(away, R * 0.2)
+            let rx = R * 0.7, ry = R * 0.22
+            let a0 = CGFloat.random(in: 0...(2 * .pi))
+            let life = min(n, 6)
+            for k in 1..<life {
+                let turn = a0 + 2 * .pi * CGFloat(k - 1) / CGFloat(max(1, life - 1))
+                for i in 0..<m.squeans {
+                    let t = turn + CGFloat(i) / CGFloat(m.squeans) * 2 * .pi
+                    let c = CGPoint(x: centre.x + cos(t) * rx, y: centre.y + sin(t) * ry)
+                    // Stars at the back of the orbit (top) are smaller.
+                    let s = R * 0.065 * (1 - 0.3 * (sin(t) + 1) / 2)
+                    let star = starPath(points: 5, radius: s, rays: [1, 1, 1, 1, 1], inner: 0.48, rotation: t, center: c)
+                    painted(star, k, into: i % 2 == 0 ? yellow : paint)
+                }
             }
         }
 
-        // Vibration lines either side of the hand, jittering in and out after the hit.
-        if m.shakes {
+        // Spiral curls: 1.5-turn dizzy spirals on the diagonals, turning 180° over their life.
+        let curlAngles = fan(m.curls, mid: away, span: 2.2, jitter: 0.2)
+        for (i, a) in curlAngles.enumerated() {
+            let c = at(a, R * 0.95)
+            let size = R * 0.14
+            let dirSign: CGFloat = i % 2 == 0 ? 1 : -1
+            for k in 1..<n {
+                let p = CGFloat(k - 1) / CGFloat(max(1, n - 2))
+                addSpiral(strokes[k], center: c, radius: size * (k == 1 ? 0.7 : 1), turns: 1.5,
+                          rotation: dirSign * .pi * p, sign: dirSign)
+            }
+        }
+
+        // Agitrons: zigzag vibration lines either side of the hand, jittering after the hit.
+        if m.agitrons {
             let hc = g.handCenter
             let axis = atan2(hc.y, hc.x)
+            let along = CGPoint(x: cos(axis), y: sin(axis))
             for k in 1..<min(4, n) {
-                let wobble: CGFloat = k % 2 == 1 ? 1 : -1
-                for side in [axis + .pi / 2, axis - .pi / 2] {
+                let wob: CGFloat = k % 2 == 1 ? 1 : -1
+                for side: CGFloat in [1, -1] {
+                    let perp = CGPoint(x: -along.y * side, y: along.x * side)
                     for j in 0..<2 {
-                        let r = g.handRadius * 1.02 + R * (0.12 * CGFloat(j) + 0.03 * wobble)
-                        let half: CGFloat = j == 0 ? 0.32 : 0.24
-                        let mid = side + .random(in: -0.05...0.05)
-                        addArcLens(lines[k], center: hc, radius: r, from: mid - half, to: mid + half,
-                                   width: R * 0.05 * (1 - 0.2 * CGFloat(k - 1)))
+                        let off = g.handRadius * 0.95 + R * (0.1 * CGFloat(j) + 0.025 * wob)
+                        let mid = CGPoint(x: hc.x * 0.85 + perp.x * off, y: hc.y * 0.85 + perp.y * off)
+                        let half = g.handRadius * (j == 0 ? 0.32 : 0.22)
+                        addZigzag(strokes[k], from: CGPoint(x: mid.x - along.x * half, y: mid.y - along.y * half),
+                                  to: CGPoint(x: mid.x + along.x * half, y: mid.y + along.y * half),
+                                  amplitude: R * 0.045, zigs: 4, normal: perp)
                     }
                 }
             }
@@ -518,105 +734,64 @@ enum TapFX {
                     let s = CGPoint(x: g.handCenter.x * 0.35 + d.x * back + perp.x * off,
                                     y: g.handCenter.y * 0.35 + d.y * back + perp.y * off)
                     let l = length * .random(in: 0.75...1.1) * (k == 0 ? 1 : 0.5)
-                    addSpike(lines[k], from: s, to: CGPoint(x: s.x + d.x * l, y: s.y + d.y * l),
-                             width: R * 0.04 * (k == 0 ? 1 : 0.7))
+                    addWedge(lines[k], from: s, to: CGPoint(x: s.x + d.x * l, y: s.y + d.y * l),
+                             width: R * 0.05 * (k == 0 ? 1 : 0.7))
                 }
             }
         }
 
-        // Ink droplets.
-        let fleckAngles = fan(m.flecks, mid: away, span: 4.2, jitter: 0.25)
-        for a in fleckAngles {
-            let speed = CGFloat.random(in: 0.85...1.2)
-            for k in 0..<min(3, n) {
-                let kk = CGFloat(k)
-                let r0 = R * (0.55 + 0.32 * kk) * speed
-                let len = R * 0.09 * (1 - 0.3 * kk)
-                addSpike(lines[k], from: at(a, r0), to: at(a, r0 + len), width: R * 0.09 * (1 - 0.3 * kk))
-            }
-        }
-
-        return TapCels(ring: ring, lines: lines, outline: outline, shade: shade, paint: paint, outlineWidth: ow)
+        return TapCels(outline: outline, red: red, yellow: yellow, paint: paint, rim: rim, flash: flash,
+                       lines: lines, strokes: strokes, outlineWidth: ow, strokeWidth: max(1.4, R * 0.04),
+                       shake: m.shake)
     }
 
     // MARK: Shapes
 
-    /// A brush-inked ring: thick on the shadow side (bottom-right), thin on the light side,
-    /// wobbly, squashed then stretched as it spreads; optionally broken into segments.
-    static func addRing(_ path: CGMutablePath, k: Int, life: Int, R: CGFloat, weight: CGFloat, broken: Bool) {
-        let p = life > 1 ? CGFloat(k) / CGFloat(life - 1) : 0
-        let e = 1 - (1 - p) * (1 - p)
-        let r = R * (0.24 + 0.6 * e)
-        let squash: [(CGFloat, CGFloat)] = [(1.16, 0.84), (0.93, 1.07), (1.03, 0.97), (1, 1)]
-        let (sx, sy) = squash[min(k, squash.count - 1)]
-        let thick = R * (0.10 * weight * (1 - 0.7 * p) + 0.012)
-        func shadow(_ ang: CGFloat) -> CGFloat { 0.45 + 0.55 * (1 + cos(ang + .pi / 4)) / 2 }
-
-        if broken {
-            let segs = 5
-            let spin = CGFloat.random(in: 0...(2 * .pi))
-            for i in 0..<segs {
-                let mid = spin + CGFloat(i) / CGFloat(segs) * 2 * .pi + .random(in: -0.12...0.12)
-                let half = .pi / CGFloat(segs) * .random(in: 0.45...0.62)
-                addArcLens(path, center: .zero, radius: r, from: mid - half, to: mid + half,
-                           width: thick * 1.6 * shadow(mid))
-            }
-            return
-        }
-        let ph1 = CGFloat.random(in: 0...(2 * .pi)), ph2 = CGFloat.random(in: 0...(2 * .pi))
-        let steps = 56
-        var outer: [CGPoint] = [], inner: [CGPoint] = []
-        for i in 0..<steps {
-            let ang = CGFloat(i) / CGFloat(steps) * 2 * .pi
-            let rr = r * (1 + 0.03 * sin(3 * ang + ph1) + 0.018 * sin(5 * ang + ph2))
-            let ri = rr - thick * shadow(ang)
-            outer.append(CGPoint(x: cos(ang) * rr * sx, y: sin(ang) * rr * sy))
-            inner.append(CGPoint(x: cos(ang) * ri * sx, y: sin(ang) * ri * sy))
-        }
-        path.addLines(between: outer)
-        path.closeSubpath()
-        path.addLines(between: inner)
-        path.closeSubpath()
+    static func circle(_ c: CGPoint, _ r: CGFloat) -> CGRect {
+        CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r)
     }
 
-    /// Painted cel shape from overlapping circles: ink outline, sepia shade, cream paint.
-    static func addPainted(circles: [(CGPoint, CGFloat)], ow: CGFloat, k: Int,
-                           outline: [CGMutablePath], shade: [CGMutablePath], paint: [CGMutablePath]) {
-        for (c, r) in circles {
-            // The outline sits a touch down-right, so the ink is heavier on the shadow side.
-            outline[k].addEllipse(in: CGRect(x: c.x - r + ow * 0.35, y: c.y - r - ow * 0.35, width: 2 * r, height: 2 * r))
-            shade[k].addEllipse(in: CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r))
-            let pr = r * 0.78
-            let pc = CGPoint(x: c.x - r * 0.16, y: c.y + r * 0.16)
-            paint[k].addEllipse(in: CGRect(x: pc.x - pr, y: pc.y - pr, width: 2 * pr, height: 2 * pr))
+    /// A star with uneven ray lengths (fractions of `radius`) and each vertex nudged ±3%,
+    /// so successive drawings boil. Outlines are stroked with round joins, which fattens
+    /// and rounds the points.
+    static func starPath(points: Int, radius r: CGFloat, rays: [CGFloat], inner: CGFloat,
+                         rotation: CGFloat, center c: CGPoint = .zero) -> CGPath {
+        let path = CGMutablePath()
+        for i in 0..<(points * 2) {
+            let a = rotation + .pi / 2 + CGFloat(i) * .pi / CGFloat(points) + .random(in: -0.03...0.03)
+            let len = (i % 2 == 0 ? rays[(i / 2) % rays.count] : inner) * r * .random(in: 0.97...1.03)
+            let p = at(a, len, c)
+            i == 0 ? path.move(to: p) : path.addLine(to: p)
         }
+        path.closeSubpath()
+        return path
     }
 
-    /// A lens-shaped brush stroke from `a` to `b`.
-    static func addSpike(_ path: CGMutablePath, from a: CGPoint, to b: CGPoint, width: CGFloat) {
+    /// A dash that is fat and round at `a` and tapers to a small round tip at `b`.
+    static func addWedge(_ path: CGMutablePath, from a: CGPoint, to b: CGPoint, width w: CGFloat) {
         let dx = b.x - a.x, dy = b.y - a.y
         let len = max(0.001, hypot(dx, dy))
-        let nx = -dy / len * width, ny = dx / len * width
-        let m = CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
-        path.move(to: a)
-        path.addQuadCurve(to: b, control: CGPoint(x: m.x + nx, y: m.y + ny))
-        path.addQuadCurve(to: a, control: CGPoint(x: m.x - nx, y: m.y - ny))
+        let nx = -dy / len, ny = dx / len
+        let w0 = w / 2, w1 = max(0.3, w * 0.12)
+        path.move(to: CGPoint(x: a.x + nx * w0, y: a.y + ny * w0))
+        path.addLine(to: CGPoint(x: b.x + nx * w1, y: b.y + ny * w1))
+        path.addLine(to: CGPoint(x: b.x - nx * w1, y: b.y - ny * w1))
+        path.addLine(to: CGPoint(x: a.x - nx * w0, y: a.y - ny * w0))
         path.closeSubpath()
+        path.addEllipse(in: circle(a, w0))
+        path.addEllipse(in: circle(b, w1))
     }
 
-    /// A curved brush stroke along a circle, pointed at both ends.
-    static func addArcLens(_ path: CGMutablePath, center c: CGPoint, radius r: CGFloat,
-                           from a0: CGFloat, to a1: CGFloat, width w: CGFloat) {
-        let steps = 14
-        var outer: [CGPoint] = [], inner: [CGPoint] = []
-        for i in 0...steps {
-            let u = CGFloat(i) / CGFloat(steps)
-            let a = a0 + (a1 - a0) * u
-            let half = w * 0.5 * sin(.pi * u)
-            outer.append(at(a, r + half, c))
-            inner.append(at(a, r - half, c))
-        }
-        path.addLines(between: outer + inner.reversed())
+    /// Teardrop with its round end at `center` facing `direction` and a pointed tail behind.
+    static func addTeardrop(_ path: CGMutablePath, center c: CGPoint, radius r: CGFloat,
+                            direction a: CGFloat, tail: CGFloat) {
+        let back = at(a + .pi, r * tail, c)
+        let ctrlL = at(a + .pi, r * 1.1, at(a + .pi / 2, r * 0.95, c))
+        let ctrlR = at(a + .pi, r * 1.1, at(a - .pi / 2, r * 0.95, c))
+        path.move(to: at(a + .pi / 2, r, c))
+        path.addArc(center: c, radius: r, startAngle: a + .pi / 2, endAngle: a - .pi / 2, clockwise: true)
+        path.addQuadCurve(to: back, control: ctrlR)
+        path.addQuadCurve(to: at(a + .pi / 2, r, c), control: ctrlL)
         path.closeSubpath()
     }
 
@@ -626,19 +801,35 @@ enum TapFX {
         path.move(to: tips[0])
         for i in 0..<4 {
             let mid = rot + .pi / 2 + (CGFloat(i) + 0.5) * .pi / 2
-            path.addQuadCurve(to: tips[(i + 1) % 4], control: at(mid, r * 0.12, c))
+            path.addQuadCurve(to: tips[(i + 1) % 4], control: at(mid, r * 0.14, c))
         }
         path.closeSubpath()
     }
 
-    static func addStar(_ path: CGMutablePath, center c: CGPoint, radius r: CGFloat, inner: CGFloat,
-                        points: Int, rotation: CGFloat) {
-        for i in 0..<(points * 2) {
-            let a = rotation + .pi / 2 + CGFloat(i) * .pi / CGFloat(points)
-            let p = at(a, i % 2 == 0 ? r : r * inner, c)
+    /// An Archimedean spiral from the centre out, for stroking.
+    static func addSpiral(_ path: CGMutablePath, center c: CGPoint, radius r: CGFloat, turns: CGFloat,
+                          rotation: CGFloat, sign: CGFloat) {
+        let steps = 40
+        let total = turns * 2 * .pi
+        for i in 0...steps {
+            let u = CGFloat(i) / CGFloat(steps)
+            let p = at(rotation + sign * u * total, r * (0.08 + 0.92 * u) * .random(in: 0.97...1.03), c)
             i == 0 ? path.move(to: p) : path.addLine(to: p)
         }
-        path.closeSubpath()
+    }
+
+    /// A short zigzag from `a` to `b`, swinging ±amplitude along `normal`.
+    static func addZigzag(_ path: CGMutablePath, from a: CGPoint, to b: CGPoint, amplitude: CGFloat,
+                          zigs: Int, normal nrm: CGPoint) {
+        path.move(to: a)
+        for i in 1..<zigs {
+            let u = CGFloat(i) / CGFloat(zigs)
+            let s: CGFloat = i % 2 == 1 ? 1 : -1
+            let amp = amplitude * .random(in: 0.85...1.15)
+            path.addLine(to: CGPoint(x: a.x + (b.x - a.x) * u + nrm.x * amp * s,
+                                     y: a.y + (b.y - a.y) * u + nrm.y * amp * s))
+        }
+        path.addLine(to: b)
     }
 }
 // END TapFX
@@ -660,6 +851,8 @@ final class OverlayController {
     private(set) var isShown = false
     private var style: PointerStyle = .tinyHand
     private var scale: CGFloat = 1
+    private var stickStyle: StickStyle = .solid
+    private var stickColor: CGColor = CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1)
     /// One effect at a time: a new tap replaces the previous one when it lands.
     private weak var currentMark: CALayer?
     /// Subtle hand-held drift about the fingertip between taps.
@@ -674,14 +867,17 @@ final class OverlayController {
         }
     }
 
-    func configure(style: PointerStyle, scale: CGFloat) {
+    func configure(style: PointerStyle, scale: CGFloat, stickStyle: StickStyle, stickColor: CGColor) {
         self.style = style
         self.scale = scale
+        self.stickStyle = stickStyle
+        self.stickColor = stickColor
         motion.reset()
         let ink = Ink.current
         for (i, p) in pointers.enumerated() {
             let backing = windows[i].screen?.backingScaleFactor ?? 2
-            p.apply(PointerArt.make(style: style, scale: scale, backing: backing, rolling: true), contentsScale: backing, ink: ink)
+            p.apply(PointerArt.make(style: style, scale: scale, backing: backing, rolling: true), contentsScale: backing,
+                    ink: ink, stickStyle: stickStyle, stickColor: stickColor)
         }
     }
 
@@ -731,7 +927,7 @@ final class OverlayController {
             p.pointer.isHidden = true
             w.root.addSublayer(p.pointer)
             p.apply(PointerArt.make(style: style, scale: scale, backing: screen.backingScaleFactor, rolling: true),
-                    contentsScale: screen.backingScaleFactor, ink: ink)
+                    contentsScale: screen.backingScaleFactor, ink: ink, stickStyle: stickStyle, stickColor: stickColor)
             p.setIdleSway(idleSway)
             w.orderFrontRegardless()
             windows.append(w)
@@ -924,6 +1120,18 @@ final class OverlayController {
         let count = c.drawings + 1  // the last "drawing" is blank
         let duration = Double(count) / 12.0
 
+        func discrete(_ key: String, _ values: [Any]) -> CAKeyframeAnimation {
+            let a = CAKeyframeAnimation(keyPath: key)
+            a.values = values
+            a.keyTimes = (0...values.count - 1).map { NSNumber(value: Double($0) / Double(count)) } + [1]
+            a.calculationMode = .discrete
+            a.duration = duration
+            a.beginTime = begin
+            a.fillMode = .forwards
+            a.isRemovedOnCompletion = false
+            return a
+        }
+
         func add(_ paths: [CGPath], _ configure: (CAShapeLayer) -> Void) {
             guard paths.contains(where: { !$0.isEmpty }) else { return }
             let s = CAShapeLayer()
@@ -932,27 +1140,44 @@ final class OverlayController {
             configure(s)
             s.path = CGMutablePath()
             s.contentsScale = backing
-            let a = CAKeyframeAnimation(keyPath: "path")
-            a.values = paths + [CGMutablePath()]
-            a.keyTimes = (0...count).map { NSNumber(value: Double($0) / Double(count)) }
-            a.calculationMode = .discrete
-            a.duration = duration
-            a.beginTime = begin
-            a.fillMode = .forwards
-            a.isRemovedOnCompletion = false
-            s.add(a, forKey: "cels")
+            s.add(discrete("path", paths + [CGMutablePath()]), forKey: "cels")
             container.addSublayer(s)
         }
-        add(c.ring) { $0.fillColor = ink.marks; $0.fillRule = .evenOdd }
-        add(c.lines) { $0.fillColor = ink.marks }
-        add(c.outline) {
-            $0.fillColor = ink.outline
-            $0.strokeColor = ink.outline
-            $0.lineWidth = c.outlineWidth * 2
-            $0.lineJoin = .round
+        func outlined(_ s: CAShapeLayer, _ color: CGColor) {
+            s.fillColor = color
+            s.strokeColor = color
+            s.lineWidth = c.outlineWidth * 2
+            s.lineJoin = .round
+            s.lineCap = .round
         }
-        add(c.shade) { $0.fillColor = ink.shade }
+        // On a dark desktop the ink outline vanishes, so a cream keyline sits under it.
+        if ink.dark { add(c.outline) { outlined($0, ink.paint); $0.lineWidth = c.outlineWidth * 2 + 2.4 } }
+        add(c.outline) { outlined($0, ink.outline) }
+        add(c.red) { $0.fillColor = Ink.red }
+        add(c.yellow) { $0.fillColor = Ink.yellow }
         add(c.paint) { $0.fillColor = ink.paint }
+        add(c.rim) { outlined($0, ink.paint) }
+        // The inverse flash is solid ink; on a dark desktop that reads as a hole, so it is red.
+        add(c.flash) { $0.fillColor = ink.dark ? Ink.red : Ink.ink }
+        add(c.lines) { $0.fillColor = ink.marks }
+        add(c.strokes) {
+            $0.fillColor = nil
+            $0.strokeColor = ink.marks
+            $0.lineWidth = c.strokeWidth
+            $0.lineJoin = .round
+            $0.lineCap = .round
+        }
+        if c.shake > 0 {
+            // Jitter the whole effect on twos for the first few drawings.
+            let steps = min(4, c.drawings)
+            let offsets: [NSValue] = (0..<steps).map { k in
+                let amp = c.shake * (1 - CGFloat(k) / CGFloat(steps))
+                return NSValue(point: NSPoint(x: .random(in: -amp...amp), y: .random(in: -amp...amp)))
+            } + [NSValue(point: .zero)]
+            let a = discrete("position", offsets)
+            a.isAdditive = true
+            container.add(a, forKey: "shake")
+        }
         return container
     }
 }

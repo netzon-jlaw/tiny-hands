@@ -65,6 +65,25 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         styleItem.submenu = styleMenu
         menu.addItem(styleItem)
 
+        let stickMenu = NSMenu()
+        for st in StickStyle.allCases {
+            _ = add(st.title, #selector(pickStickStyle(_:)), state: settings.stickStyle == st, to: stickMenu, rep: st.rawValue)
+        }
+        stickMenu.addItem(.separator())
+        let current = settings.stickColor.uppercased()
+        for c in StickColor.allCases {
+            let i = add(c.title, #selector(pickStickColor(_:)), state: current == c.hex, to: stickMenu, rep: c.hex)
+            i.image = Self.swatch(c.hex)
+        }
+        if !StickColor.allCases.contains(where: { $0.hex == current }) {
+            let i = add("Custom", #selector(showSettings), state: true, to: stickMenu)
+            i.image = Self.swatch(current)
+        }
+        let stickItem = NSMenuItem(title: "Stick", action: nil, keyEquivalent: "")
+        stickItem.submenu = stickMenu
+        stickItem.isEnabled = settings.style != .classicArrow
+        menu.addItem(stickItem)
+
         let levelMenu = NSMenu()
         for l in TapLevel.allCases {
             let i = add("\(l.rawValue)  \(l.title)", #selector(pickLevel(_:)), state: settings.level == l, to: levelMenu, rep: l.rawValue)
@@ -103,6 +122,24 @@ final class MenuBarController: NSObject, NSMenuDelegate {
         }
     }
 
+    static func swatch(_ hex: String) -> NSImage {
+        NSImage(size: NSSize(width: 14, height: 14), flipped: false) { r in
+            let p = NSBezierPath(ovalIn: r.insetBy(dx: 1, dy: 1))
+            NSColor(cgColor: CGColor.fromHex(hex) ?? .white)?.setFill()
+            p.fill()
+            NSColor.tertiaryLabelColor.setStroke()
+            p.lineWidth = 1
+            p.stroke()
+            return true
+        }
+    }
+
+    @objc private func pickStickStyle(_ i: NSMenuItem) {
+        if let r = i.representedObject as? String, let s = StickStyle(rawValue: r) { settings.stickStyle = s }
+    }
+    @objc private func pickStickColor(_ i: NSMenuItem) {
+        if let r = i.representedObject as? String { settings.stickColor = r }
+    }
     @objc private func togglePointer() { app.toggle() }
     @objc private func togglePresentation() { app.togglePresentation() }
     @objc private func pickStyle(_ i: NSMenuItem) {

@@ -41,6 +41,31 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Stick") {
+                Picker("Stick", selection: $settings.stickStyle) {
+                    ForEach(StickStyle.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                HStack(spacing: 8) {
+                    Text("Colour")
+                    Spacer()
+                    ForEach(StickColor.allCases) { c in
+                        StickSwatch(color: Color(cgColor: CGColor.fromHex(c.hex)!), title: c.title,
+                                    selected: settings.stickColor.uppercased() == c.hex) { settings.stickColor = c.hex }
+                    }
+                    ColorPicker("Custom colour", selection: Binding(
+                        get: { Color(cgColor: CGColor.fromHex(settings.stickColor) ?? .white) },
+                        set: { if let c = NSColor($0).usingColorSpace(.sRGB)?.cgColor { settings.stickColor = c.hexString } }
+                    ), supportsOpacity: false)
+                    .labelsHidden()
+                    .help("Custom colour")
+                }
+                if settings.style == .classicArrow {
+                    Text("The Classic pointer has no stick.").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .disabled(settings.style == .classicArrow)
+
             Section("Tap mood") {
                 Picker("Mood", selection: $settings.level) {
                     ForEach(TapLevel.allCases) { Text($0.title).tag($0) }
@@ -90,6 +115,26 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 520, height: min(720, (NSScreen.main?.visibleFrame.height ?? 800) - 60))
+    }
+}
+
+struct StickSwatch: View {
+    let color: Color
+    let title: String
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Circle().fill(color)
+                .frame(width: 18, height: 18)
+                .overlay(Circle().stroke(Color.primary.opacity(0.35), lineWidth: 1))
+                .padding(3)
+                .overlay(Circle().stroke(selected ? Color.orange : .clear, lineWidth: 2))
+        }
+        .buttonStyle(.plain)
+        .help(title)
+        .accessibilityLabel(title)
     }
 }
 

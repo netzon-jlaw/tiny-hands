@@ -43,10 +43,6 @@ struct PointerArt {
         let tilt: CGFloat
         switch style {
         case .tinyHand: name = "tiny-hand"; height = base * 1.1; tilt = 22 * .pi / 180
-        case .middleChild: name = "middle-child"; height = base * 1.1; tilt = 0
-        case .peace: name = "peace"; height = base * 1.1; tilt = 0
-        case .thumbsUp: name = "thumbs-up"; height = base * 1.1; tilt = 0
-        case .rockOn: name = "rock-on"; height = base * 1.1; tilt = 0
         case .highFive: name = "high-five"; height = base * 1.1; tilt = 0
         case .catPaw: name = "cat-paw"; height = base * 1.1; tilt = 18 * .pi / 180
         case .classicArrow: name = "classic-arrow"; height = base * 0.66; tilt = 0

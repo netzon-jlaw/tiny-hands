@@ -24,15 +24,15 @@ final class AppController: ObservableObject {
     private init() {}
 
     func start() {
-        overlay.configure(style: settings.style, scale: settings.size)
-        settings.$style.dropFirst().sink { [weak self] s in
-            guard let self else { return }
-            self.overlay.configure(style: s, scale: self.settings.size)
-        }.store(in: &bag)
-        settings.$size.dropFirst().sink { [weak self] z in
-            guard let self else { return }
-            self.overlay.configure(style: self.settings.style, scale: z)
-        }.store(in: &bag)
+        reconfigure()
+        // @Published fires before the stored value changes, so read the new values on the next run-loop turn.
+        Publishers.MergeMany(settings.$style.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+                             settings.$size.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+                             settings.$stickStyle.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+                             settings.$stickColor.dropFirst().map { _ in () }.eraseToAnyPublisher())
+            .receive(on: RunLoop.main)
+            .sink { [weak self] in self?.reconfigure() }
+            .store(in: &bag)
         settings.$toggleShortcut.sink { [weak self] s in
             HotKeyCenter.shared.register(id: 1, shortcut: s) { self?.toggle() }
         }.store(in: &bag)
@@ -50,6 +50,11 @@ final class AppController: ObservableObject {
                 if t != self.accessibilityGranted { self.accessibilityGranted = t }
             }
         }
+    }
+
+    private func reconfigure() {
+        overlay.configure(style: settings.style, scale: settings.size, stickStyle: settings.stickStyle,
+                          stickColor: CGColor.fromHex(settings.stickColor) ?? CGColor(srgbRed: 1, green: 1, blue: 1, alpha: 1))
     }
 
     // MARK: - State

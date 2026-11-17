@@ -83,8 +83,8 @@ enum TapLevel: Int, CaseIterable, Identifiable {
     }
     var blurb: String {
         switch self {
-        case .subtle: return "A few ink dashes. Board-meeting safe."
-        case .polite: return "Dashes and a little dust puff."
+        case .subtle: return "A peck and a few flying dashes. Board-meeting safe."
+        case .polite: return "A bouncier tap with a swirl of dashes."
         case .lively: return "A real poke: a pow star and flung stars."
         case .loud: return "Hit flash, yellow pow, drops and the shakes."
         case .unhinged: return "Red pow, dizzy stars, spirals, the works."

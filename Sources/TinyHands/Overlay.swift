@@ -377,6 +377,9 @@ struct TapMark {
     var dashes = 4
     /// Dash rings (2 = a second, wider ring a drawing later).
     var dashRings = 1
+    /// Dashes keep flying outward over five drawings, swirling a little, instead of
+    /// popping and fading in three. Gives the quiet moods movement without more particles.
+    var dashFly = false
     /// Points on the pow starburst behind the hit (0 = none).
     var pow = 0
     /// Pow paint: 0 cream, 1 pale yellow, 2 faded red with a yellow core.
@@ -430,18 +433,19 @@ struct TapRecipe {
         let chatter = TapBounce(height: 0.05, up: 0.012, down: 0.012)
         switch l {
         case ...1:
-            // A polite single peck: a small lift, straight back down, nothing else.
-            return TapRecipe(lift: 0.3, swing: 2, grow: 1.04, windUp: 0.040, hang: 0, slam: 0.026,
-                             squash: 0.97, bounces: [], wobble: 0,
-                             mark: TapMark(radius: 28, drawings: 3, dashes: 5))
+            // A real peck with a little chatter; only a few dashes, but they fly.
+            return TapRecipe(lift: 0.55, swing: 4, grow: 1.07, windUp: 0.042, hang: 0, slam: 0.027,
+                             squash: 0.94, bounces: [chatter], wobble: 0,
+                             mark: TapMark(radius: 30, drawings: 5, dashes: 5, dashFly: true))
         case 2:
-            return TapRecipe(lift: 0.55, swing: 4, grow: 1.08, windUp: 0.044, hang: 0, slam: 0.028,
-                             squash: 0.95, bounces: [chatter], wobble: 0,
-                             mark: TapMark(radius: 32, drawings: 3, dashes: 6, puffs: 1))
+            return TapRecipe(lift: 0.75, swing: 5, grow: 1.1, windUp: 0.046, hang: 0, slam: 0.029,
+                             squash: 0.92, bounces: [chatter, TapBounce(height: 0.1, up: 0.04, down: 0.03)],
+                             wobble: 1.2,
+                             mark: TapMark(radius: 36, drawings: 5, dashes: 7, dashFly: true))
         case 3:
             return TapRecipe(lift: 0.9, swing: 6, grow: 1.13, windUp: 0.048, hang: 0, slam: 0.030,
                              squash: 0.92, bounces: [chatter, TapBounce(height: 0.16, up: 0.05, down: 0.035)],
-                             wobble: 0,
+                             wobble: 1.8,
                              mark: TapMark(radius: 42, drawings: 5, dashes: 8, pow: 6, stars: 2, streaks: 2))
         case 4:
             return TapRecipe(lift: 1.4, swing: 9, grow: 1.22, windUp: 0.052, hang: 0.006, slam: 0.030,
@@ -586,10 +590,14 @@ enum TapFX {
             let lens = angles.map { _ in CGFloat.random(in: 0.8...1.15) }
             let start = ringIndex            // the outer ring starts a drawing later
             let far: CGFloat = ringIndex == 0 ? 1 : 1.3
-            let stages: [(CGFloat, CGFloat, CGFloat)] = [(0.55, 0.80, 1.0), (0.62, 1.02, 0.9), (0.88, 1.1, 0.55)]
+            let stages: [(CGFloat, CGFloat, CGFloat)] = m.dashFly
+                ? [(0.42, 0.70, 1.0), (0.56, 0.98, 0.95), (0.78, 1.14, 0.8), (0.98, 1.26, 0.6), (1.16, 1.34, 0.4)]
+                : [(0.55, 0.80, 1.0), (0.62, 1.02, 0.9), (0.88, 1.1, 0.55)]
+            // Flying dashes swirl about the hit as they go, all the same way.
+            let swirl: CGFloat = m.dashFly ? (Bool.random() ? 0.07 : -0.07) : 0
             for (s, stage) in stages.enumerated() where start + s < n {
                 for (i, a0) in angles.enumerated() {
-                    let a = a0 + .random(in: -0.03...0.03)
+                    let a = a0 + swirl * CGFloat(s) + .random(in: -0.03...0.03)
                     let r0 = R * stage.0 * push * far
                     let r1 = r0 + (R * stage.1 * push * far - r0) * lens[i]
                     addWedge(lines[start + s], from: at(a, r0), to: at(a, r1), width: dashW * stage.2 * (ringIndex == 0 ? 1 : 0.8))

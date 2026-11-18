@@ -2,8 +2,14 @@ import AVFoundation
 
 /// Plays a short toy-hand tap (bundled CC0 samples, with a synthesized fallback) as ordinary system audio,
 /// so it is picked up by "share sound" in Zoom / Meet / Loom.
-@MainActor
-final class KnockPlayer {
+///
+/// All engine work runs on its own serial queue, never the main thread. Starting an
+/// AVAudioEngine talks to CoreAudio and can block for a long time, or fail over and over,
+/// while the output device is changing (a call ending and a headset leaving call mode, for
+/// example). On the main thread that stalled the pointer's tracking timer.
+final class KnockPlayer: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "TinyHands.KnockPlayer", qos: .userInitiated)
+    // Everything below is touched only on `queue` (or in init, before the queue is used).
     private let engine = AVAudioEngine()
     private var players: [AVAudioPlayerNode] = []
     private var speeds: [AVAudioUnitVarispeed] = []
@@ -12,7 +18,9 @@ final class KnockPlayer {
     private var lastPick: [String: Int] = [:]
     private var next = 0
     private var buffers: [AVAudioPCMBuffer] = []
-    private var started = false
+    /// When the engine last failed to start, so a device that keeps refusing is retried
+    /// at most once a second rather than on every click.
+    private var lastFailedStart: CFTimeInterval = -.infinity
     private let format = AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)!
 
     init() {
@@ -33,27 +41,43 @@ final class KnockPlayer {
         for name in ["tap", "poke", "thwack"] { pools[name] = loadPool(name) }
         NSLog("TinyHands sounds loaded: tap=%d poke=%d thwack=%d", pools["tap"]!.count, pools["poke"]!.count, pools["thwack"]!.count)
 
+        // The output device changed and the engine stopped. Restart it here, in the
+        // background, so the next click doesn't pay for it.
         NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: engine,
-                                               queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.started = false }
+                                               queue: nil) { [weak self] _ in
+            guard let self else { return }
+            self.queue.async {
+                self.lastFailedStart = -.infinity
+                _ = self.ensureStarted()
+            }
         }
+        queue.async { _ = self.ensureStarted() }
     }
 
+    /// Call on `queue` only.
     private func ensureStarted() -> Bool {
-        if started && engine.isRunning { return true }
+        if engine.isRunning { return true }
+        let now = CACurrentMediaTime()
+        guard now - lastFailedStart > 1 else { return false }
         do {
             engine.prepare()
             try engine.start()
-            started = true
+            return true
         } catch {
-            started = false
+            lastFailedStart = now
+            NSLog("TinyHands audio engine failed to start: \(error)")
+            return false
         }
-        return started
     }
 
-    /// level 1...5
+    /// level 1...5. Safe to call from any thread; returns at once.
     func knock(level: Int, volume: Double) {
-        guard volume > 0, ensureStarted() else { return }
+        guard volume > 0 else { return }
+        queue.async { self.play(level: level, volume: volume) }
+    }
+
+    private func play(level: Int, volume: Double) {
+        guard ensureStarted() else { return }
         let p = players[next]
         let v = speeds[next]
         next = (next + 1) % players.count

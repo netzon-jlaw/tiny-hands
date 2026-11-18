@@ -929,7 +929,7 @@ final class OverlayController {
         timer = nil
         boilTimer?.invalidate()
         boilTimer = nil
-        windows.forEach { $0.orderOut(nil) }
+        windows.forEach { $0.orderOut(nil); $0.close() }
         windows.removeAll()
         pointers.removeAll()
         activeIndex = -1
@@ -937,7 +937,7 @@ final class OverlayController {
 
     private func rebuildWindows() {
         guard isShown else { return }
-        windows.forEach { $0.orderOut(nil) }
+        windows.forEach { $0.orderOut(nil); $0.close() }
         windows.removeAll()
         pointers.removeAll()
         let ink = Ink.current
